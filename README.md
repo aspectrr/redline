@@ -1,54 +1,87 @@
 # email-for-agents
 
-A small Rust CLI + agent skill that lets coding agents (pi, Claude Code, Cursor, …) write emails in your voice by learning from **(draft → final)** revision pairs you make.
+A local email client + library for teaching coding agents (pi, Claude Code, Cursor, …) to write emails in your voice, by learning from **(draft → final)** revision pairs.
 
-The CLI just stores pairs and lessons in SQLite and surfaces them. All the *reasoning* (deriving voice rules from diffs) happens in the agent session via the bundled `email-voice` skill — no LLM call leaves your agent.
+The whole point is the loop: the agent drafts, you edit, the diff is captured and searchable, and every revision is restorable from one place. The *reasoning* (deriving voice rules from a diff) stays in the agent session — no LLM call leaves your agent.
 
-## Install
+## Two surfaces, one library, one DB
+
+```
+src/lib.rs                 shared library: schema, diff, pairs, lessons, drafts, revisions
+src/main.rs (email-learn)  CLI — learning loop + agent ingest
+email-app/                 Tauri 2 desktop client (React + TS + Vite)
+~/.email-learn/emails.db   one shared SQLite DB (WAL) — CLI and app read/write the same file
+```
+
+The CLI and the Tauri app both call into `email_learn` (the library), so there is exactly one implementation of the data model and the diffing. Overriding the DB path: `EMAIL_LEARN_DB=/abs/path/emails.db`.
+
+## Data model
+
+- **`pairs`** — a completed (draft, final, diff) with context + tags. The learning corpus.
+- **`lessons`** — concrete voice rules an agent derived from a pair's diff.
+- **`drafts`** — an in-flight draft the agent created, not yet finalized.
+- **`draft_revisions`** — append-only content history per draft. This is "restore in one place": every save is a row, restore appends a new revision copying an old one, and history is never destroyed.
+
+`finalize` = latest revision becomes the final, the first revision is the agent's original, the diff is computed, a `pairs` row is written, and the draft is linked to it.
+
+## Run the app
 
 ```bash
-cargo install --path .
+cd email-app
+bun install          # frontend deps
+bun run tauri dev    # launches the desktop window (builds the Rust shell on first run)
 ```
 
-Puts the `email-learn` binary on your `PATH` (in `~/.cargo/bin`).
+The app has three views:
+- **Drafts** — inbox of agent-pushed drafts on the left, editor in the middle (autosaves a revision ~1.2s after you stop typing), and a right pane with tabs for the **live diff** (original → current), **revisions** (restore any version), and **lessons**.
+- **Library** — finalized pairs with side-by-side draft/final/diff, plus the lessons list.
+- **Search** — across every draft, revision, pair, and lesson.
 
-## Use it as an agent skill
+## Agent ingest
 
-The skill lives in `skills/email-voice/SKILL.md`. Symlink it into your agent's global skills directory:
+The agent pushes a draft into the app via the CLI:
 
 ```bash
-# pi
-ln -s "$PWD/skills/email-voice" ~/.pi/agent/skills/email-voice
+email-learn draft body.txt --context "cold intro to investor" --tags pitch,external
 ```
 
-Then any pi agent can load it by name (`email-voice`) and follow its workflows.
+It then appears in the app's Drafts inbox for you to edit. (A small MCP server exposing `create_draft` / `finalize` / `query` is the planned next step — see Roadmap.)
 
-## Data location
-
-- DB defaults to `~/.email-learn/emails.db` — global, shared across all projects so your voice lessons accumulate everywhere.
-- Override with `EMAIL_LEARN_DB=/abs/path/emails.db`.
-
-## Commands
+## CLI
 
 ```
+# learning loop
 email-learn add <draft> <final> --context "<one line>" --tags a,b      # store a pair → prints id
-email-learn show <id>                                                  # draft + final + diff as JSON
-email-learn recent [N]                                                 # N most recent pairs (default 10)
+email-learn show <id>                                                  # draft + final + diff
+email-learn recent [N]                                                 # N most recent pairs
 email-learn lessons [--tags a,b]                                       # stored voice lessons
 email-learn add-lesson <pair_id> "<lesson>" --tags a,b                 # record a derived rule
 email-learn query "<needle>"                                           # LIKE search pairs + lessons
-email-learn export                                                     # everything as one markdown dump
+email-learn export                                                     # everything as markdown
+email-learn summarize                                                  # optional LLM seam (noop stub today)
+
+# drafting surface (agent ingest)
+email-learn draft <file|-> --context "<one line>" --tags a,b [--source agent]   # → draft id
+email-learn finalize <draft_id>                                                # → pair id
+email-learn drafts [--all]
 ```
 
-## How learning works
+Install the CLI on its own: `cargo install --path .` (puts `email-learn` on `$PATH`).
 
-1. You give the agent a draft you wrote **and** the version you actually sent.
-2. The agent stores the pair, reads the diff, and derives 1–3 specific voice lessons
-   (word swaps, structural moves, tone shifts, things you *never* do).
-3. Next time you ask the agent to draft an email, it pulls `lessons`, `query`, and `recent`
-   first and writes to your rules.
+## Use it as an agent skill
 
-See `skills/email-voice/SKILL.md` for the full workflow and what counts as a good lesson.
+The skill lives in `skills/email-voice/SKILL.md`. Symlink it into your agent's skills dir:
+
+```bash
+ln -s "$PWD/skills/email-voice" ~/.pi/agent/skills/email-voice
+```
+
+Then any pi agent can load it by name (`email-voice`) and follow its draft → diff → lesson workflow.
+
+## Roadmap
+
+- **MCP server** (`email-mcp`) so pi/Claude can call `create_draft` / `finalize` / `query` as tools instead of shelling out to the CLI.
+- **LLM provider** behind `EMAIL_LEARN_LLM` — wire the `LessonSummarizer` seam to ollama / openai / an MCP provider for lesson summarization and `/style-review`-style audits. Lesson *derivation* stays in the agent session either way.
 
 ## License
 

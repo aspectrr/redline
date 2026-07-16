@@ -3,9 +3,17 @@ name = "email-learn"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "email_learn"
+path = "src/lib.rs"
+
 [[bin]]
 name = "email-learn"
 path = "src/main.rs"
+
+[workspace]
+members = ["email-app/src-tauri"]
+resolver = "2"
 
 [dependencies]
 rusqlite = { version = "0.31", features = ["bundled"] }
