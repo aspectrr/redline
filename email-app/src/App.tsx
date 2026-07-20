@@ -56,6 +56,16 @@ export default function App() {
 
   useEffect(() => { refreshDrafts(); }, [refreshDrafts]);
 
+  // Agents push drafts via CLI/MCP while the user is in another window. The only
+  // built-in refresh triggers are mount and the showFinalized toggle — so refresh
+  // on window focus (switch back to the app) and when switching to the Drafts tab.
+  useEffect(() => {
+    const refresh = () => refreshDrafts();
+    window.addEventListener("focus", refresh);
+    return () => window.removeEventListener("focus", refresh);
+  }, [refreshDrafts]);
+  useEffect(() => { if (view === "drafts") refreshDrafts(); }, [view, refreshDrafts]);
+
   // autosave flush: write pending edit synchronously, returns when done.
   const flushSave = useCallback(async () => {
     if (saveTimer.current) { window.clearTimeout(saveTimer.current); saveTimer.current = null; }
