@@ -3,7 +3,7 @@ import { api, parseDiff } from "./lib/api";
 import type { Draft, DraftWithRevisions, DiffRow, Lesson, Pair, SearchResult } from "./lib/api";
 import "./App.css";
 
-type View = "drafts" | "library" | "search";
+type View = "drafts" | "library" | "search" | "lessons";
 type RightTab = "diff" | "revisions" | "lessons";
 
 export default function App() {
@@ -159,7 +159,7 @@ export default function App() {
     } catch (e) { flushError(e); }
   }, []);
 
-  useEffect(() => { if (view === "library") reloadLibrary(); }, [view, reloadLibrary]);
+  useEffect(() => { if (view === "library" || view === "lessons") reloadLibrary(); }, [view, reloadLibrary]);
 
   const runSearch = async () => {
     try { setResults(await api.search(q)); } catch (e) { flushError(e); }
@@ -177,6 +177,7 @@ export default function App() {
           <button className={view === "drafts" ? "active" : ""} onClick={() => setView("drafts")}>Drafts</button>
           <button className={view === "library" ? "active" : ""} onClick={() => setView("library")}>Library</button>
           <button className={view === "search" ? "active" : ""} onClick={() => setView("search")}>Search</button>
+          <button className={view === "lessons" ? "active" : ""} onClick={() => setView("lessons")}>Lessons</button>
         </nav>
         {view === "search" && (
           <div className="search-inline">
@@ -297,6 +298,23 @@ export default function App() {
         </div>
       )}
 
+      {view === "lessons" && (
+        <div className="search-layout">
+          <section>
+            <h3>All lessons ({lessons.length})</h3>
+            <ul className="lesson-list">
+              {lessons.map(l => (
+                <li key={l.id}>
+                  <div>{l.lesson}</div>
+                  <div className="lesson-meta">L{l.id} · pair #{l.pair_id ?? "—"} · [{l.tags.join(", ")}]</div>
+                </li>
+              ))}
+              {lessons.length === 0 && <li className="empty">No lessons yet. Derive one from a pair's diff.</li>}
+            </ul>
+          </section>
+        </div>
+      )}
+
       {view === "search" && (
         <div className="search-layout">
           {results == null ? (
@@ -404,6 +422,9 @@ function LessonsPane({ lessons, pairId, onChanged }: {
 }) {
   const [text, setText] = useState("");
   const [tagsStr, setTagsStr] = useState("");
+  // pair-scoped: only lessons derived from this pair, not the whole corpus.
+  // Use the All Lessons tab to see every lesson.
+  const shown = pairId == null ? [] : lessons.filter(l => l.pair_id === pairId);
   const add = async () => {
     if (pairId == null || !text.trim()) return;
     const tags = tagsStr.split(",").map(t => t.trim()).filter(Boolean);
@@ -414,10 +435,10 @@ function LessonsPane({ lessons, pairId, onChanged }: {
   return (
     <div className="lessons">
       <ul className="lesson-list">
-        {lessons.map(l => (
+        {shown.map(l => (
           <li key={l.id}><div>{l.lesson}</div><div className="lesson-meta">L{l.id} · pair #{l.pair_id ?? "—"} · [{l.tags.join(", ")}]</div></li>
         ))}
-        {lessons.length === 0 && <li className="empty small">No lessons yet. Derive one from a diff and add it here.</li>}
+        {shown.length === 0 && pairId != null && <li className="empty small">No lessons for this pair yet. Derive one from the diff and add it here.</li>}
       </ul>
       <div className="add-lesson">
         <textarea value={text} onChange={e => setText(e.target.value)} placeholder="a specific lesson (e.g. ‘use quick note, not I wanted to reach out’)" rows={2} />
