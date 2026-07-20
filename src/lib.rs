@@ -320,16 +320,11 @@ pub fn show_pair(conn: &Connection, id: i64) -> anyhow::Result<Option<Pair>> {
     )?;
     let mut rows = stmt.query(params![id])?;
     if let Some(r) = rows.next()? {
-        let tags = parse_tags(r.get::<_, Option<String>>(5)?.as_deref());
-        Ok(Some(Pair {
-            id: r.get(0)?,
-            draft: r.get(1)?,
-            final_: r.get(2)?,
-            diff: r.get(3)?,
-            context: r.get(4)?,
-            tags,
-            created_at: r.get(6)?,
-        }))
+        // Delegate to row_to_pair so the stored diff is normalized via
+        // pair_diff() (legacy plain-text rows recomputed into JSON) — same as
+        // recent_pairs. Reading the raw column here skipped normalization and
+        // made the UI show "no changes yet" for pre-migration pairs.
+        Ok(Some(row_to_pair(r)?))
     } else {
         Ok(None)
     }
@@ -880,5 +875,38 @@ mod tests {
         assert_eq!(rev_count, 0);
         // the finalized pair (learning corpus) is left intact
         assert!(show_pair(&conn, pair_id).unwrap().is_some());
+    }
+
+    #[test]
+    fn show_pair_normalizes_legacy_plain_text_diff() {
+        // A pair written before the rich-diff JSON migration stores a plain
+        // unified diff in the `diff` column. show_pair must normalize it back
+        // to structured JSON (via pair_diff) — otherwise the frontend's
+        // JSON.parse fails and the UI shows "no changes yet".
+        let path = tmp_db();
+        let conn = connect_at(&path).unwrap();
+        conn.execute(
+            "INSERT INTO pairs (draft, final, diff, context, tags, created_at) \
+             VALUES (?1,?2,?3,?4,?5,?6)",
+            params![
+                "Hey man,\nOption 1 works.\n",
+                "Hi Carolina,\nThanks.\n",
+                "-Hey man,\n+Hi Carolina,\n+Thanks.\n", // legacy plain text
+                "test",
+                "[]",
+                now_iso(),
+            ],
+        ).unwrap();
+        let pair = show_pair(&conn, 1).unwrap().expect("pair exists");
+        // diff must parse as structured JSON, not plain text
+        let rows: Vec<DiffRow> = serde_json::from_str(&pair.diff)
+            .expect("show_pair diff is JSON Vec<DiffRow>");
+        let added: String = rows.iter()
+            .find(|r| r.kind == "added").expect("added row")
+            .segments.iter().map(|s| s.text.as_str()).collect();
+        assert!(added.contains("Carolina"), "recomputed added line: {added}");
+        // and recent_pairs must agree (same normalization path)
+        let list = recent_pairs(&conn, 10).unwrap();
+        assert_eq!(list[0].diff, pair.diff, "show_pair and recent_pairs agree");
     }
 }
