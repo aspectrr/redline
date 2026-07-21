@@ -80,6 +80,12 @@ struct IdParams {
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+struct ListPatternsParams {
+    /// Optional: filter patterns by lesson_id. Omit to list ALL patterns.
+    lesson_id: Option<i64>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
 struct RecentParams {
     /// How many pairs to return (default 10).
     limit: Option<i64>,
@@ -477,10 +483,9 @@ impl EmailServer {
 
     /// List stored voice patterns.
     #[tool(description = "List all stored voice patterns, or filter by lesson_id.")]
-    fn list_patterns(&self, Parameters(p): Parameters<IdParams>) -> ToolResult {
+    fn list_patterns(&self, Parameters(p): Parameters<ListPatternsParams>) -> ToolResult {
         tool_op(|conn| {
-            // IdParams.id used as optional lesson_id filter here; 0 = all
-            let lesson_id = if p.id > 0 { Some(p.id) } else { None };
+            let lesson_id = p.lesson_id.filter(|&id| id > 0);
             let patterns = el::list_patterns(conn, lesson_id)?;
             Ok(ok_json(serde_json::json!({ "patterns": patterns })))
         })

@@ -954,6 +954,16 @@ fn categorize_change(before: &str, after: &str) -> CategorizedChange {
     let b = before.trim();
     let a = after.trim();
 
+    // ponytail: skip blank-line noise — both empty = no real change
+    if b.is_empty() && a.is_empty() {
+        return CategorizedChange {
+            category: "noop".into(),
+            description: String::new(),
+            before: String::new(),
+            after: String::new(),
+        };
+    }
+
     // pure deletion — line removed with no replacement
     if !b.is_empty() && a.is_empty() {
         return CategorizedChange {
@@ -975,8 +985,11 @@ fn categorize_change(before: &str, after: &str) -> CategorizedChange {
     }
 
     // Check for factual changes: numbers, names, dates
-    let num_re = regex::Regex::new(r"\$?[0-9][0-9,]*(\.[0-9]+)?%?").unwrap();
-    let date_re = regex::Regex::new(r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2}\b").unwrap();
+    use std::sync::OnceLock;
+    static NUM_RE: OnceLock<regex::Regex> = OnceLock::new();
+    static DATE_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let num_re = NUM_RE.get_or_init(|| regex::Regex::new(r"\$?[0-9][0-9,]*(\.[0-9]+)?%?").unwrap());
+    let date_re = DATE_RE.get_or_init(|| regex::Regex::new(r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2}\b").unwrap());
     let b_nums: Vec<&str> = num_re.find_iter(b).map(|m| m.as_str()).collect();
     let a_nums: Vec<&str> = num_re.find_iter(a).map(|m| m.as_str()).collect();
     let b_dates = date_re.is_match(b);
@@ -1009,13 +1022,15 @@ fn categorize_change(before: &str, after: &str) -> CategorizedChange {
         };
     }
 
-    // Check for structural: very different lengths or many words changed
+    // Check for structural: large word-count change relative to line length.
+    // Only structural if at least 4 words differ AND the original had
+    // enough content that this isn't just a word-level trim.
     let b_words = b.split_whitespace().count();
     let a_words = a.split_whitespace().count();
     let len_diff = (b_words as i64 - a_words as i64).unsigned_abs();
-    if len_diff >= 4 || (b_words > 3 && a_words > 3 && b_words as f64 / a_words.max(1) as f64 > 1.5)
-        || (a_words > 3 && b_words > 3 && a_words as f64 / b_words.max(1) as f64 > 1.5)
-    {
+    let max_words = b_words.max(a_words);
+    // 4+ words added/removed on a line that originally had 6+ words
+    if len_diff >= 4 && max_words >= 6 {
         return CategorizedChange {
             category: "structural".into(),
             description: format!("Structural rewrite: \"{}\" \u{2192} \"{}\"", truncate_str(b, 50), truncate_str(a, 50)),
@@ -1114,6 +1129,12 @@ pub fn analyze_diff(conn: &Connection, pair_id: i64) -> anyhow::Result<Option<Di
             _ => pair.final_.to_lowercase().contains(&p.pattern.to_lowercase()),
         })
         .map(|p| PatternHit { pattern_id: p.id, rule: p.rule.clone() })
+        .collect();
+
+    // Filter out noop entries (blank-line diffs that produce no signal)
+    let categorized: Vec<CategorizedChange> = categorized
+        .into_iter()
+        .filter(|c| c.category != "noop")
         .collect();
 
     Ok(Some(DiffAnalysis {
