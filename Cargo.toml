@@ -1,18 +1,18 @@
 [package]
-name = "email-learn"
+name = "redline"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
-name = "email_learn"
+name = "redline"
 path = "src/lib.rs"
 
 [[bin]]
-name = "email-learn"
+name = "redline"
 path = "src/main.rs"
 
 [workspace]
-members = ["email-app/src-tauri"]
+members = ["redline-app/src-tauri"]
 resolver = "2"
 
 [dependencies]

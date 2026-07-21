@@ -1,6 +1,6 @@
-// email-learn library: store (draft, final) email pairs, agent-derived voice
-// lessons, and the in-flight drafting surface. Shared by the `email-learn` CLI
-// (including its MCP server), the `email-app` Tauri UI, and any MCP client.
+// redline library: store (draft, final) email pairs, agent-derived voice
+// lessons, and the in-flight drafting surface. Shared by the `redline` CLI
+// (including its MCP server), the `redline-app` Tauri UI, and any MCP client.
 // No LLM call from here on purpose — the agent derives lessons in-session
 // against the diffs we surface.
 
@@ -76,15 +76,15 @@ CREATE INDEX IF NOT EXISTS idx_draft_revisions_draft ON draft_revisions(draft_id
 ";
 
 /// Where the shared, cross-project voice DB lives.
-/// Override with `EMAIL_LEARN_DB=/abs/path/emails.db`.
+/// Override with `REDLINE_DB=/abs/path/emails.db`.
 pub fn db_path() -> PathBuf {
-    if let Ok(p) = std::env::var("EMAIL_LEARN_DB") {
+    if let Ok(p) = std::env::var("REDLINE_DB") {
         return PathBuf::from(p);
     }
     let mut p = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    p.push(".email-learn");
+    p.push(".redline");
     p.push("emails.db");
     p
 }
@@ -1288,7 +1288,7 @@ pub fn search_all(conn: &Connection, needle: &str) -> anyhow::Result<SearchResul
 // is only for *summarization/audit* over already-derived lessons (distill
 // themes, surface contradictions/stale rules). It is behind an env flag so the
 // default build makes zero LLM calls. Stub now; wire a provider later
-// (ollama | openai | mcp keyed off EMAIL_LEARN_LLM).
+// (ollama | openai | mcp keyed off REDLINE_LLM).
 
 pub trait LessonSummarizer: Send + Sync {
     fn summarize(&self, lessons: &[Lesson]) -> anyhow::Result<String>;
@@ -1297,7 +1297,7 @@ pub trait LessonSummarizer: Send + Sync {
 pub struct NoopSummarizer;
 impl LessonSummarizer for NoopSummarizer {
     fn summarize(&self, _: &[Lesson]) -> anyhow::Result<String> {
-        Ok("LLM summarization disabled. Set EMAIL_LEARN_LLM to enable \
+        Ok("LLM summarization disabled. Set REDLINE_LLM to enable \
             (future: ollama | openai | mcp). Derivation stays in the agent session.".into())
     }
 }

@@ -1,4 +1,4 @@
-// Typed wrappers over the Tauri commands in email-app/src-tauri/src/lib.rs.
+// Typed wrappers over the Tauri commands in redline-app/src-tauri/src/lib.rs.
 // Command names are exactly the snake_case Rust fn names.
 import { invoke } from "@tauri-apps/api/core";
 

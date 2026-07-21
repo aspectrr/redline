@@ -22,7 +22,7 @@ jobs:
 
       # Install frontend deps before tauri-action runs beforeBuildCommand
       - name: Install frontend deps
-        run: cd email-app && bun install
+        run: cd redline-app && bun install
 
       # Build + create release. No code signing — app is unsigned.
       # Users bypass Gatekeeper: right-click > Open (first time only).
@@ -30,14 +30,14 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          projectPath: email-app
+          projectPath: redline-app
           tagName: ${{ github.ref_name }}
-          releaseName: "Email for Agents ${{ github.ref_name }}"
+          releaseName: "Redline ${{ github.ref_name }}"
           releaseBody: |
             ## Install
 
             1. Download the `.dmg` below
-            2. Open it, drag **Email for Agents** to Applications
+            2. Open it, drag **Redline** to Applications
             3. First launch: right-click the app → **Open** → **Open anyway**
                (macOS Gatekeeper blocks unsigned apps on first run)
 

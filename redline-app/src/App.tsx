@@ -232,7 +232,7 @@ export default function App() {
   return (
     <div className="app">
       <header className="topbar">
-        <div className="brand">✉️ Email for Agents</div>
+        <div className="brand">✉️ Redline</div>
         <nav className="tabs">
           <button className={view === "drafts" ? "active" : ""} onClick={() => setView("drafts")}>Drafts</button>
           <button className={view === "library" ? "active" : ""} onClick={() => setView("library")}>Library</button>
@@ -278,7 +278,7 @@ export default function App() {
                   </div>
                 </li>
               ))}
-              {drafts.length === 0 && <li className="empty">No drafts. The agent can push one via <code>email-learn draft</code>, or click + New draft.</li>}
+              {drafts.length === 0 && <li className="empty">No drafts. The agent can push one via <code>redline draft</code>, or click + New draft.</li>}
             </ul>
           </aside>
 
@@ -790,7 +790,7 @@ function FeedbackView({ feedback }: { feedback: Feedback[] }) {
     <div className="search-layout">
       <section>
         <h3>Feedback ({feedback.length})</h3>
-        <p className="hint">Agents log feedback via the <code>give_feedback</code> MCP tool or <code>email-learn feedback</code> CLI command.</p>
+        <p className="hint">Agents log feedback via the <code>give_feedback</code> MCP tool or <code>redline feedback</code> CLI command.</p>
         {feedback.length === 0 ? (
           <div className="empty">No feedback yet.</div>
         ) : (

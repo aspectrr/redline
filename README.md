@@ -1,4 +1,4 @@
-# email-for-agents
+# redline
 
 A local email client + library for teaching coding agents (pi, Claude Code, Cursor, …) to write emails in your voice, by learning from **(draft → final)** revision pairs.
 
@@ -9,12 +9,12 @@ The whole point is the loop: the agent drafts, you edit, the diff is captured an
 ```
 src/lib.rs                 shared library: schema, diff, pairs, lessons, drafts, revisions
 src/mcp.rs                 MCP server (stdio) — every CLI feature as tools
-src/main.rs (email-learn)  CLI — learning loop, agent ingest, and `mcp` subcommand
-email-app/                 Tauri 2 desktop client (React + TS + Vite)
-~/.email-learn/emails.db   one shared SQLite DB (WAL) — CLI, MCP server, and app all read/write it
+src/main.rs (redline)  CLI — learning loop, agent ingest, and `mcp` subcommand
+redline-app/                 Tauri 2 desktop client (React + TS + Vite)
+~/.redline/emails.db   one shared SQLite DB (WAL) — CLI, MCP server, and app all read/write it
 ```
 
-The CLI and the Tauri app both call into `email_learn` (the library), so there is exactly one implementation of the data model and the diffing. Overriding the DB path: `EMAIL_LEARN_DB=/abs/path/emails.db`.
+The CLI and the Tauri app both call into `redline` (the library), so there is exactly one implementation of the data model and the diffing. Overriding the DB path: `REDLINE_DB=/abs/path/emails.db`.
 
 ## Data model
 
@@ -28,7 +28,7 @@ The CLI and the Tauri app both call into `email_learn` (the library), so there i
 ## Run the app
 
 ```bash
-cd email-app
+cd redline-app
 bun install          # frontend deps
 bun run tauri dev    # launches the desktop window (builds the Rust shell on first run)
 ```
@@ -44,7 +44,7 @@ The agent pushes a draft two ways:
 
 **CLI** (one-shot):
 ```bash
-email-learn draft body.txt --context "cold intro to investor" --tags pitch,external
+redline draft body.txt --context "cold intro to investor" --tags pitch,external
 ```
 
 **MCP server** (preferred for agents) — connect once and call tools directly (no subprocess per call). See [MCP server](#mcp-server) below.
@@ -55,30 +55,30 @@ Either way the draft appears in the app's Drafts inbox for you to edit.
 
 ```
 # learning loop
-email-learn add <draft> <final> --context "<one line>" --tags a,b      # store a pair → prints id
-email-learn show <id>                                                  # draft + final + diff
-email-learn recent [N]                                                 # N most recent pairs
-email-learn lessons [--tags a,b]                                       # stored voice lessons
-email-learn add-lesson <pair_id> "<lesson>" --tags a,b                 # record a derived rule
-email-learn query "<needle>"                                           # LIKE search pairs + lessons
-email-learn export                                                     # everything as markdown
-email-learn summarize                                                  # optional LLM seam (noop stub today)
+redline add <draft> <final> --context "<one line>" --tags a,b      # store a pair → prints id
+redline show <id>                                                  # draft + final + diff
+redline recent [N]                                                 # N most recent pairs
+redline lessons [--tags a,b]                                       # stored voice lessons
+redline add-lesson <pair_id> "<lesson>" --tags a,b                 # record a derived rule
+redline query "<needle>"                                           # LIKE search pairs + lessons
+redline export                                                     # everything as markdown
+redline summarize                                                  # optional LLM seam (noop stub today)
 
 # drafting surface (agent ingest)
-email-learn draft <file|-> --context "<one line>" --tags a,b [--source agent]   # → draft id
-email-learn finalize <draft_id>                                                # → pair id
-email-learn drafts [--all]
-email-learn delete-draft <draft_id>                                            # remove a draft (keeps any finalized pair)
+redline draft <file|-> --context "<one line>" --tags a,b [--source agent]   # → draft id
+redline finalize <draft_id>                                                # → pair id
+redline drafts [--all]
+redline delete-draft <draft_id>                                            # remove a draft (keeps any finalized pair)
 
 # MCP server (stdio) — agents connect and call tools
-email-learn mcp                                                                # speaks JSON-RPC over stdio
+redline mcp                                                                # speaks JSON-RPC over stdio
 ```
 
-Install the CLI on its own: `cargo install --path .` (puts `email-learn` on `$PATH`).
+Install the CLI on its own: `cargo install --path .` (puts `redline` on `$PATH`).
 
 ## MCP server
 
-`email-learn mcp` runs an MCP server over stdio exposing the full surface as tools — so a coding agent (pi, Claude, Cursor) can read pairs/diffs/lessons, record derived lessons, push and edit drafts, and search, all over one connection instead of shelling out per call. Built on [rmcp](https://crates.io/crates/rmcp) (the official Rust MCP SDK).
+`redline mcp` runs an MCP server over stdio exposing the full surface as tools — so a coding agent (pi, Claude, Cursor) can read pairs/diffs/lessons, record derived lessons, push and edit drafts, and search, all over one connection instead of shelling out per call. Built on [rmcp](https://crates.io/crates/rmcp) (the official Rust MCP SDK).
 
 **17 tools:** `add_pair`, `show_pair`, `recent_pairs`, `list_lessons`, `add_lesson`, `query`, `search`, `export`, `summarize`, `create_draft`, `get_draft`, `list_drafts`, `save_revision`, `restore_revision`, `finalize_draft`, `delete_draft`, `update_draft_meta`. Diffs come back as plain unified text; tool-level failures return caller-visible errors (the agent sees the message).
 
@@ -88,28 +88,28 @@ Add it to an agent config (e.g. pi's `~/.pi/config.*` or Claude Desktop's `claud
 {
   "mcpServers": {
     "email": {
-      "command": "email-learn",
+      "command": "redline",
       "args": ["mcp"]
     }
   }
 }
 ```
 
-The same `EMAIL_LEARN_DB` override applies (point multiple agents at the same DB). Lesson *derivation* still happens in the agent session — the server only stores and retrieves.
+The same `REDLINE_DB` override applies (point multiple agents at the same DB). Lesson *derivation* still happens in the agent session — the server only stores and retrieves.
 
 ## Use it as an agent skill
 
-The skill lives in `skills/email-voice/SKILL.md`. Symlink it into your agent's skills dir:
+The skill lives in `skills/redline/SKILL.md`. Symlink it into your agent's skills dir:
 
 ```bash
-ln -s "$PWD/skills/email-voice" ~/.pi/agent/skills/email-voice
+ln -s "$PWD/skills/redline" ~/.pi/agent/skills/redline
 ```
 
-Then any pi agent can load it by name (`email-voice`) and follow its draft → diff → lesson workflow.
+Then any pi agent can load it by name (`redline`) and follow its draft → diff → lesson workflow.
 
 ## Roadmap
 
-- **LLM provider** behind `EMAIL_LEARN_LLM` — wire the `LessonSummarizer` seam to ollama / openai / an MCP provider for lesson summarization and `/style-review`-style audits. Lesson *derivation* stays in the agent session either way.
+- **LLM provider** behind `REDLINE_LLM` — wire the `LessonSummarizer` seam to ollama / openai / an MCP provider for lesson summarization and `/style-review`-style audits. Lesson *derivation* stays in the agent session either way.
 
 ## License
 

@@ -1,7 +1,7 @@
-// Tauri commands over the shared `email_learn` library. Every command opens its
+// Tauri commands over the shared `redline` library. Every command opens its
 // own connection (cheap for a local SQLite file; WAL lets the CLI and UI share).
 
-use email_learn as el;
+use redline as el;
 use tauri::Emitter;
 
 type CmdResult<T> = Result<T, String>;

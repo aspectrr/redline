@@ -1,4 +1,4 @@
-// MCP server over stdio. Exposes the whole email-learn surface as tools so a
+// MCP server over stdio. Exposes the whole redline surface as tools so a
 // coding agent (pi, Claude, …) can read pairs/diffs/lessons, record derived
 // lessons, push and edit drafts, and search — the same loop the CLI offers, but
 // callable as MCP tools instead of a subprocess.
@@ -21,7 +21,7 @@ use rmcp::{
     tool, tool_handler, tool_router,
 };
 
-// mcp.rs lives inside the email_learn crate, so reference siblings via `crate`.
+// mcp.rs lives inside the redline crate, so reference siblings via `crate`.
 use crate as el;
 
 type ToolResult = Result<CallToolResult, McpError>;
@@ -38,7 +38,7 @@ pub async fn serve() -> anyhow::Result<()> {
         .init();
 
     tracing::info!(
-        "email-learn MCP server starting (db: {})",
+        "redline MCP server starting (db: {})",
         el::db_path().display()
     );
 
@@ -513,7 +513,7 @@ impl EmailServer {
     // --- feedback (agents and humans can log issues) ---
 
     /// Log feedback about the tool — bugs, suggestions, confusion points.
-    #[tool(description = "Log feedback about the email-learn tool. Accepts a free-text message, optional tool_name, severity (info/warning/error/suggestion), and 1-5 rating. This is how agents report what's painful.")]
+    #[tool(description = "Log feedback about the redline tool. Accepts a free-text message, optional tool_name, severity (info/warning/error/suggestion), and 1-5 rating. This is how agents report what's painful.")]
     fn give_feedback(&self, Parameters(p): Parameters<FeedbackParams>) -> ToolResult {
         tool_op(|conn| {
             let id = el::add_feedback(
@@ -546,7 +546,7 @@ impl ServerHandler for EmailServer {
         .with_server_info(Implementation::from_build_env())
         .with_protocol_version(ProtocolVersion::V_2024_11_05)
         .with_instructions(
-            "email-learn: a local voice-learning system for email agents.\n\
+            "redline: a local voice-learning system for email agents.\n\
              \nWORKFLOW (one pass through the loop):\n\
              1. create_draft — writes the draft AND returns all voice patterns + lint\n\
                 violations. Fix violations with save_revision before the user sees it.\n\

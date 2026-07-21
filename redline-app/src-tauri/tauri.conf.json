@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Email for Agents",
+  "productName": "Redline",
   "version": "0.1.0",
-  "identifier": "com.orca.email-app",
+  "identifier": "com.orca.redline",
   "build": {
     "beforeDevCommand": "bun run dev",
     "devUrl": "http://localhost:1420",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Email for Agents",
+        "title": "Redline",
         "width": 1240,
         "height": 820
       }

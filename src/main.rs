@@ -1,13 +1,13 @@
-// email-learn CLI: thin wrapper over the `email_learn` library so both this
-// binary and the `email-app` Tauri UI share one implementation.
+// redline CLI: thin wrapper over the `redline` library so both this
+// binary and the `redline-app` Tauri UI share one implementation.
 
 use clap::{Parser, Subcommand};
-use email_learn as el;
+use redline as el;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 #[derive(Parser)]
-#[command(name = "email-learn", version, about = "Store (draft, final) email pairs + voice lessons for agent learning.")]
+#[command(name = "redline", version, about = "Store (draft, final) email pairs + voice lessons for agent learning.")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -50,7 +50,7 @@ enum Cmd {
     Export,
 
     /// Summarize/audit stored lessons via the (optional) LLM seam.
-    /// Default noop stub; wire a provider behind EMAIL_LEARN_LLM later.
+    /// Default noop stub; wire a provider behind REDLINE_LLM later.
     Summarize,
 
     // --- drafting surface (agent ingest) ---
