@@ -2,6 +2,7 @@
 // own connection (cheap for a local SQLite file; WAL lets the CLI and UI share).
 
 use email_learn as el;
+use tauri::Emitter;
 
 type CmdResult<T> = Result<T, String>;
 
@@ -185,10 +186,47 @@ fn analyze_pair(pair_id: i64) -> CmdResult<Option<serde_json::Value>> {
     Ok(result)
 }
 
+use notify_debouncer_mini::{new_debouncer, DebounceEventResult};
+use std::time::Duration;
+
+/// Spawn a file watcher on the DB directory. Emits `db-changed` Tauri events
+/// when the `.db` or `.db-wal` file is modified by an external process
+/// (CLI or MCP server writing to the same shared DB).
+fn spawn_db_watcher(app: tauri::AppHandle) {
+    let db_path = el::db_path();
+    let watch_dir = db_path.parent().map(|p| p.to_path_buf());
+
+    let Some(watch_dir) = watch_dir else { return };
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut debouncer = match new_debouncer(Duration::from_millis(500), move |_ev: DebounceEventResult| {
+        let _ = tx.send(());
+    }) {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+
+    if debouncer.watcher().watch(&watch_dir, notify::RecursiveMode::NonRecursive).is_err() {
+        return;
+    }
+
+    std::thread::spawn(move || {
+        // Keep debouncer alive — dropping it stops watching.
+        let _debouncer = debouncer;
+        while rx.recv().is_ok() {
+            app.emit("db-changed", ()).ok();
+        }
+    });
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .setup(|app| {
+            spawn_db_watcher(app.handle().clone());
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             list_drafts,
             get_draft,

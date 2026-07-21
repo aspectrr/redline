@@ -72,13 +72,17 @@ export default function App() {
   }, [refreshDrafts]);
   useEffect(() => { if (view === "drafts") refreshDrafts(); }, [view, refreshDrafts]);
 
-  // ponytail: 5s poll catches MCP/CLI draft pushes while the user sits on
-  // the Drafts tab. Upgrade path: Tauri event from the backend on DB change.
+  // Backend emits `db-changed` when an external process (CLI/MCP) writes to
+  // the shared DB. Replaces the 5s poll with push-based refresh.
   useEffect(() => {
-    if (view !== "drafts") return;
-    const id = setInterval(refreshDrafts, 5000);
-    return () => clearInterval(id);
-  }, [view, refreshDrafts]);
+    let unlisten: (() => void) | undefined;
+    let active = true;
+    (async () => {
+      const { listen } = await import("@tauri-apps/api/event");
+      unlisten = await listen("db-changed", () => { if (active) refreshDrafts(); });
+    })();
+    return () => { active = false; unlisten?.(); };
+  }, [refreshDrafts]);
 
   // autosave flush: write pending edit synchronously, returns when done.
   const flushSave = useCallback(async () => {
