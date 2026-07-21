@@ -1,52 +1,52 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { createSignal, createMemo, createEffect, onMount, onCleanup, on, For, Show, type JSX } from "solid-js";
 import { api, parseDiff } from "./lib/api";
-import type { Draft, DraftWithRevisions, DiffRow, Lesson, Pair, SearchResult, Pattern, Violation, Feedback, DiffAnalysis } from "./lib/api";
+import type { Draft, DraftWithRevisions, Lesson, Pair, SearchResult, Pattern, Violation, Feedback, DiffAnalysis } from "./lib/api";
 import "./App.css";
 
 type View = "drafts" | "library" | "search" | "lessons" | "patterns" | "feedback";
 type RightTab = "diff" | "revisions" | "lessons" | "lint";
 
 export default function App() {
-  const [view, setView] = useState<View>("drafts");
+  const [view, setView] = createSignal<View>("drafts");
 
   // drafts
-  const [drafts, setDrafts] = useState<Draft[]>([]);
-  const [showFinalized, setShowFinalized] = useState(false);
-  const [selectedId, setSelectedId] = useState<number | null>(null);
-  const [current, setCurrent] = useState<DraftWithRevisions | null>(null);
-  const [editorText, setEditorText] = useState("");
-  const [dirty, setDirty] = useState(false);
-  const [saving, setSaving] = useState(false);
-  const saveTimer = useRef<number | null>(null);
-  const [ctx, setCtx] = useState("");
-  const [tagsStr, setTagsStr] = useState("");
-  const [rightTab, setRightTab] = useState<RightTab>("diff");
-  const [error, setError] = useState<string | null>(null);
+  const [drafts, setDrafts] = createSignal<Draft[]>([]);
+  const [showFinalized, setShowFinalized] = createSignal(false);
+  const [selectedId, setSelectedId] = createSignal<number | null>(null);
+  const [current, setCurrent] = createSignal<DraftWithRevisions | null>(null);
+  const [editorText, setEditorText] = createSignal("");
+  const [dirty, setDirty] = createSignal(false);
+  const [saving, setSaving] = createSignal(false);
+  let saveTimer: ReturnType<typeof setTimeout> | null = null;
+  const [ctx, setCtx] = createSignal("");
+  const [tagsStr, setTagsStr] = createSignal("");
+  const [rightTab, setRightTab] = createSignal<RightTab>("diff");
+  const [error, setError] = createSignal<string | null>(null);
 
   // library
-  const [pairs, setPairs] = useState<Pair[]>([]);
-  const [selectedPair, setSelectedPair] = useState<Pair | null>(null);
-  const [lessons, setLessons] = useState<Lesson[]>([]);
+  const [pairs, setPairs] = createSignal<Pair[]>([]);
+  const [selectedPair, setSelectedPair] = createSignal<Pair | null>(null);
+  const [lessons, setLessons] = createSignal<Lesson[]>([]);
 
   // search
-  const [q, setQ] = useState("");
-  const [results, setResults] = useState<SearchResult | null>(null);
+  const [q, setQ] = createSignal("");
+  const [results, setResults] = createSignal<SearchResult | null>(null);
 
   // lint + patterns + feedback
-  const [violations, setViolations] = useState<Violation[]>([]);
-  const [linting, setLinting] = useState(false);
-  const [patterns, setPatterns] = useState<Pattern[]>([]);
-  const [feedback, setFeedback] = useState<Feedback[]>([]);
+  const [violations, setViolations] = createSignal<Violation[]>([]);
+  const [linting, setLinting] = createSignal(false);
+  const [patterns, setPatterns] = createSignal<Pattern[]>([]);
+  const [feedback, setFeedback] = createSignal<Feedback[]>([]);
 
   const flushError = (e: unknown) => setError(e instanceof Error ? e.message : String(e));
 
-  const refreshDrafts = useCallback(async () => {
+  const refreshDrafts = async () => {
     try {
-      setDrafts(await api.listDrafts(showFinalized));
+      setDrafts(await api.listDrafts(showFinalized()));
     } catch (e) { flushError(e); }
-  }, [showFinalized]);
+  };
 
-  const loadDraft = useCallback(async (id: number) => {
+  const loadDraft = async (id: number) => {
     try {
       const d = await api.getDraft(id);
       setCurrent(d);
@@ -58,61 +58,65 @@ export default function App() {
         setRightTab("diff");
       }
     } catch (e) { flushError(e); }
-  }, []);
+  };
 
-  useEffect(() => { refreshDrafts(); }, [refreshDrafts]);
+  // View-scoped reloads. createEffect(on(view)) runs on mount (view="drafts")
+  // and on every tab switch — covers the original mount + per-view effects.
+  createEffect(on(view, (v) => {
+    if (v === "drafts") refreshDrafts();
+    if (v === "library" || v === "lessons") reloadLibrary();
+    if (v === "patterns") reloadPatterns();
+    if (v === "feedback") reloadFeedback();
+  }));
 
-  // Agents push drafts via CLI/MCP while the user is in another window. The only
-  // built-in refresh triggers are mount and the showFinalized toggle — so refresh
-  // on window focus (switch back to the app) and when switching to the Drafts tab.
-  useEffect(() => {
+  // Agents push drafts via CLI/MCP while the user is in another window. Refresh
+  // on window focus (switch back to the app).
+  onMount(() => {
     const refresh = () => refreshDrafts();
     window.addEventListener("focus", refresh);
-    return () => window.removeEventListener("focus", refresh);
-  }, [refreshDrafts]);
-  useEffect(() => { if (view === "drafts") refreshDrafts(); }, [view, refreshDrafts]);
+    onCleanup(() => window.removeEventListener("focus", refresh));
+  });
 
   // Backend emits `db-changed` when an external process (CLI/MCP) writes to
   // the shared DB. Replaces the 5s poll with push-based refresh.
-  useEffect(() => {
+  onMount(() => {
     let unlisten: (() => void) | undefined;
-    let active = true;
     (async () => {
       const { listen } = await import("@tauri-apps/api/event");
-      unlisten = await listen("db-changed", () => { if (active) refreshDrafts(); });
+      unlisten = await listen("db-changed", () => refreshDrafts());
     })();
-    return () => { active = false; unlisten?.(); };
-  }, [refreshDrafts]);
+    onCleanup(() => unlisten?.());
+  });
 
   // autosave flush: write pending edit synchronously, returns when done.
-  const flushSave = useCallback(async () => {
-    if (saveTimer.current) { window.clearTimeout(saveTimer.current); saveTimer.current = null; }
-    if (!dirty || selectedId == null || !current) return;
-    const last = current.revisions[current.revisions.length - 1]?.content;
-    if (editorText === last) { setDirty(false); return; }
+  const flushSave = async () => {
+    if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
+    if (!dirty() || selectedId() == null || !current()) return;
+    const id = selectedId()!;
+    const last = current()!.revisions[current()!.revisions.length - 1]?.content;
+    if (editorText() === last) { setDirty(false); return; }
     setSaving(true);
     try {
-      await api.saveRevision(selectedId, editorText, "user");
-      const d = await api.getDraft(selectedId);
-      setCurrent(d);
+      await api.saveRevision(id, editorText(), "user");
+      setCurrent(await api.getDraft(id));
       setDirty(false);
     } catch (e) { flushError(e); }
     finally { setSaving(false); }
-  }, [dirty, editorText, selectedId, current]);
+  };
 
-  const onEditorChange = (val: string) => {
+  const onEditorInput = (val: string) => {
     setEditorText(val);
     setDirty(true);
-    if (saveTimer.current) window.clearTimeout(saveTimer.current);
-    saveTimer.current = window.setTimeout(async () => {
-      if (selectedId == null) return;
-      const last = current?.revisions[current.revisions.length - 1]?.content;
+    if (saveTimer) clearTimeout(saveTimer);
+    saveTimer = setTimeout(async () => {
+      if (selectedId() == null) return;
+      const id = selectedId()!;
+      const last = current()?.revisions[current()!.revisions.length - 1]?.content;
       if (val === last) { setDirty(false); return; }
       setSaving(true);
       try {
-        await api.saveRevision(selectedId, val, "user");
-        const d = await api.getDraft(selectedId);
-        setCurrent(d);
+        await api.saveRevision(id, val, "user");
+        setCurrent(await api.getDraft(id));
         setDirty(false);
         refreshDrafts();
       } catch (e) { flushError(e); }
@@ -121,7 +125,7 @@ export default function App() {
   };
 
   const selectDraft = async (id: number) => {
-    if (dirty) await flushSave();
+    if (dirty()) await flushSave();
     setSelectedId(id);
     await loadDraft(id);
   };
@@ -136,38 +140,41 @@ export default function App() {
   };
 
   const saveMeta = async () => {
-    if (selectedId == null) return;
+    if (selectedId() == null) return;
+    const id = selectedId()!;
     try {
-      const tags = tagsStr.split(",").map(t => t.trim()).filter(Boolean);
-      await api.updateDraftMeta(selectedId, ctx.trim() || null, tags);
-      await loadDraft(selectedId);
+      const tags = tagsStr().split(",").map(t => t.trim()).filter(Boolean);
+      await api.updateDraftMeta(id, ctx().trim() || null, tags);
+      await loadDraft(id);
       refreshDrafts();
     } catch (e) { flushError(e); }
   };
 
   const restore = async (revisionId: number) => {
-    if (selectedId == null) return;
+    if (selectedId() == null) return;
+    const id = selectedId()!;
     try {
-      await api.restoreRevision(selectedId, revisionId);
-      await loadDraft(selectedId);
+      await api.restoreRevision(id, revisionId);
+      await loadDraft(id);
       refreshDrafts();
     } catch (e) { flushError(e); }
   };
 
   const finalize = async () => {
-    if (selectedId == null) return;
+    if (selectedId() == null) return;
+    const id = selectedId()!;
     try {
       await flushSave();
-      await api.finalizeDraft(selectedId);
-      await loadDraft(selectedId);
+      await api.finalizeDraft(id);
+      await loadDraft(id);
       await refreshDrafts();
       setRightTab("lessons");
     } catch (e) { flushError(e); }
   };
 
   const deleteDraft = async () => {
-    if (selectedId == null) return;
-    const id = selectedId;
+    if (selectedId() == null) return;
+    const id = selectedId()!;
     try {
       await api.deleteDraft(id);
       setSelectedId(null);
@@ -195,17 +202,15 @@ export default function App() {
     } catch (e) { flushError(e); }
   };
 
-  const reloadLibrary = useCallback(async () => {
+  const reloadLibrary = async () => {
     try {
       setPairs(await api.listPairs(200));
       setLessons(await api.listLessons());
     } catch (e) { flushError(e); }
-  }, []);
-
-  useEffect(() => { if (view === "library" || view === "lessons") reloadLibrary(); }, [view, reloadLibrary]);
+  };
 
   const runSearch = async () => {
-    try { setResults(await api.search(q)); } catch (e) { flushError(e); }
+    try { setResults(await api.search(q())); } catch (e) { flushError(e); }
   };
 
   const runLint = async (content: string) => {
@@ -214,36 +219,33 @@ export default function App() {
     finally { setLinting(false); }
   };
 
-  const reloadPatterns = useCallback(async () => {
+  const reloadPatterns = async () => {
     try { setPatterns(await api.listPatterns()); } catch (e) { flushError(e); }
-  }, []);
+  };
 
-  const reloadFeedback = useCallback(async () => {
+  const reloadFeedback = async () => {
     try { setFeedback(await api.listFeedback()); } catch (e) { flushError(e); }
-  }, []);
-
-  useEffect(() => { if (view === "patterns") reloadPatterns(); }, [view, reloadPatterns]);
-  useEffect(() => { if (view === "feedback") reloadFeedback(); }, [view, reloadFeedback]);
+  };
 
   const openPair = async (id: number) => {
     try { setSelectedPair(await api.showPair(id)); } catch (e) { flushError(e); }
   };
 
   return (
-    <div className="app">
-      <header className="topbar">
-        <div className="brand">✉️ Redline</div>
-        <nav className="tabs">
-          <button className={view === "drafts" ? "active" : ""} onClick={() => setView("drafts")}>Drafts</button>
-          <button className={view === "library" ? "active" : ""} onClick={() => setView("library")}>Library</button>
-          <button className={view === "search" ? "active" : ""} onClick={() => setView("search")}>Search</button>
-          <button className={view === "lessons" ? "active" : ""} onClick={() => setView("lessons")}>Lessons</button>
-          <button className={view === "patterns" ? "active" : ""} onClick={() => setView("patterns")}>Patterns</button>
-          <button className={view === "feedback" ? "active" : ""} onClick={() => setView("feedback")}>Feedback</button>
+    <div class="app">
+      <header class="topbar">
+        <div class="brand">✉️ Redline</div>
+        <nav class="tabs">
+          <button class={view() === "drafts" ? "active" : ""} onClick={() => setView("drafts")}>Drafts</button>
+          <button class={view() === "library" ? "active" : ""} onClick={() => setView("library")}>Library</button>
+          <button class={view() === "search" ? "active" : ""} onClick={() => setView("search")}>Search</button>
+          <button class={view() === "lessons" ? "active" : ""} onClick={() => setView("lessons")}>Lessons</button>
+          <button class={view() === "patterns" ? "active" : ""} onClick={() => setView("patterns")}>Patterns</button>
+          <button class={view() === "feedback" ? "active" : ""} onClick={() => setView("feedback")}>Feedback</button>
         </nav>
-        {view === "search" && (
-          <div className="search-inline">
-            <input value={q} onChange={e => setQ(e.target.value)}
+        {view() === "search" && (
+          <div class="search-inline">
+            <input value={q()} onInput={e => setQ(e.currentTarget.value)}
               onKeyDown={e => { if (e.key === "Enter") runSearch(); }}
               placeholder="search drafts, pairs, lessons…" />
             <button onClick={runSearch}>Search</button>
@@ -251,90 +253,90 @@ export default function App() {
         )}
       </header>
 
-      {error && <div className="error" onClick={() => setError(null)}>⚠ {error}</div>}
+      {error() && <div class="error" onClick={() => setError(null)}>⚠ {error()}</div>}
 
-      {view === "drafts" && (
-        <div className="drafts-layout">
-          <aside className="list-pane">
-            <div className="list-head">
-              <button className="primary" onClick={newDraft}>+ New draft</button>
-              <label className="toggle">
-                <input type="checkbox" checked={showFinalized}
-                  onChange={e => { setShowFinalized(e.target.checked); }} />
+      {view() === "drafts" && (
+        <div class="drafts-layout">
+          <aside class="list-pane">
+            <div class="list-head">
+              <button class="primary" onClick={newDraft}>+ New draft</button>
+              <label class="toggle">
+                <input type="checkbox" checked={showFinalized()}
+                  onChange={e => setShowFinalized(e.currentTarget.checked)} />
                 show finalized
               </label>
             </div>
-            <ul className="draft-list">
-              {drafts.map(d => (
-                <li key={d.id} className={selectedId === d.id ? "selected" : ""} onClick={() => selectDraft(d.id)}>
-                  <div className="row1">
-                    <span className={"status " + d.status}>{d.status === "finalized" ? "✓" : "✎"}</span>
-                    <span className="ctx">{d.context || "(no context)"}</span>
+            <ul class="draft-list">
+              <For each={drafts()}>{(d) => (
+                <li class={selectedId() === d.id ? "selected" : ""} onClick={() => selectDraft(d.id)}>
+                  <div class="row1">
+                    <span class={"status " + d.status}>{d.status === "finalized" ? "✓" : "✎"}</span>
+                    <span class="ctx">{d.context || "(no context)"}</span>
                   </div>
-                  <div className="row2">
+                  <div class="row2">
                     <span>#{d.id}</span>
-                    <span className="tags">{d.tags.join(", ")}</span>
-                    <span className="when">{shortWhen(d.updated_at)}</span>
+                    <span class="tags">{d.tags.join(", ")}</span>
+                    <span class="when">{shortWhen(d.updated_at)}</span>
                   </div>
                 </li>
-              ))}
-              {drafts.length === 0 && <li className="empty">No drafts. The agent can push one via <code>redline draft</code>, or click + New draft.</li>}
+              )}</For>
+              {drafts().length === 0 && <li class="empty">No drafts. The agent can push one via <code>redline draft</code>, or click + New draft.</li>}
             </ul>
           </aside>
 
-          <section className="editor-pane">
-            {current ? (
+          <section class="editor-pane">
+            {current() ? (
               <>
-                <div className="meta-row">
-                  <input className="ctx-input" value={ctx} onChange={e => setCtx(e.target.value)}
+                <div class="meta-row">
+                  <input class="ctx-input" value={ctx()} onInput={e => setCtx(e.currentTarget.value)}
                     placeholder="context (topic + recipient type)" />
-                  <input className="tags-input" value={tagsStr} onChange={e => setTagsStr(e.target.value)}
+                  <input class="tags-input" value={tagsStr()} onInput={e => setTagsStr(e.currentTarget.value)}
                     placeholder="tags: pitch, external" />
                   <button onClick={saveMeta}>Save meta</button>
-                  {current.draft.status === "finalized" ? (
-                    <button className="primary" disabled>Finalized ✓</button>
+                  {current()!.draft.status === "finalized" ? (
+                    <button class="primary" disabled>Finalized ✓</button>
                   ) : (
                     <ConfirmButton label="Finalize →" confirmLabel="Confirm finalize" onConfirm={finalize} />
                   )}
                   <ConfirmButton label="Delete" confirmLabel="Confirm delete" danger onConfirm={deleteDraft} />
                 </div>
-                <div className="editor-status">
-                  <span>draft #{current.draft.id}</span>
-                  <span>{current.revisions.length} revision(s)</span>
-                  <span>{saving ? "saving…" : dirty ? "unsaved" : "saved"}</span>
+                <div class="editor-status">
+                  <span>draft #{current()!.draft.id}</span>
+                  <span>{current()!.revisions.length} revision(s)</span>
+                  <span>{saving() ? "saving…" : dirty() ? "unsaved" : "saved"}</span>
                 </div>
-                <textarea className="editor" value={editorText}
-                  onChange={e => onEditorChange(e.target.value)}
-                  disabled={current.draft.status === "finalized"}
-                  placeholder="Write the email…" spellCheck={false} />
+                <textarea class="editor" value={editorText()}
+                  onInput={e => onEditorInput(e.currentTarget.value)}
+                  disabled={current()!.draft.status === "finalized"}
+                  placeholder="Write the email…" spellcheck={false} />
               </>
             ) : (
-              <div className="empty-editor">Select a draft, or start a new one.</div>
+              <div class="empty-editor">Select a draft, or start a new one.</div>
             )}
           </section>
 
-          <aside className="right-pane">
-            <div className="right-tabs">
-              <button className={rightTab === "diff" ? "active" : ""} onClick={() => setRightTab("diff")}>Diff</button>
-              <button className={rightTab === "revisions" ? "active" : ""} onClick={() => setRightTab("revisions")}>Revisions</button>
-              <button className={rightTab === "lint" ? "active" : ""} onClick={() => { setRightTab("lint"); if (current) runLint(editorText); }}>Lint</button>
-              <button className={rightTab === "lessons" ? "active" : ""} onClick={() => setRightTab("lessons")}>Lessons</button>
+          <aside class="right-pane">
+            <div class="right-tabs">
+              <button class={rightTab() === "diff" ? "active" : ""} onClick={() => setRightTab("diff")}>Diff</button>
+              <button class={rightTab() === "revisions" ? "active" : ""} onClick={() => setRightTab("revisions")}>Revisions</button>
+              <button class={rightTab() === "lint" ? "active" : ""} onClick={() => { setRightTab("lint"); if (current()) runLint(editorText()); }}>Lint</button>
+              <button class={rightTab() === "lessons" ? "active" : ""} onClick={() => setRightTab("lessons")}>Lessons</button>
             </div>
-            <div className="right-body">
-              {rightTab === "diff" && current && (
-                <DiffPane diff={current.working_diff}
-                  oldText={current.revisions[0]?.content}
-                  newText={current.revisions[current.revisions.length - 1]?.content} />
+            <div class="right-body">
+              {rightTab() === "diff" && current() && (
+                <DiffPane diff={current()!.working_diff}
+                  oldText={current()!.revisions[0]?.content}
+                  newText={current()!.revisions[current()!.revisions.length - 1]?.content} />
               )}
-              {rightTab === "lint" && current && (
-                <LintPane violations={violations} linting={linting} onRelint={() => runLint(editorText)} />
+              {rightTab() === "lint" && current() && (
+                <LintPane violations={violations()} linting={linting()} onRelint={() => runLint(editorText())} />
               )}
-              {rightTab === "revisions" && current && (
-                <RevisionsPane revisions={current.revisions} onRestore={restore} />
+              {rightTab() === "revisions" && current() && (
+                <RevisionsPane revisions={current()!.revisions} onRestore={restore} />
               )}
-              {rightTab === "lessons" && current && (
-                <LessonsPane lessons={lessons}
-                  pairId={current.draft.finalized_pair_id}
+              {rightTab() === "lessons" && current() && (
+                <LessonsPane lessons={lessons()}
+                  pairId={current()!.draft.finalized_pair_id}
                   onChanged={reloadLibrary}
                   onDeleteLesson={deleteLesson} />
               )}
@@ -343,273 +345,253 @@ export default function App() {
         </div>
       )}
 
-      {view === "library" && (
-        <div className="library-layout">
-          <aside className="list-pane">
-            <div className="list-head"><strong>Pairs ({pairs.length})</strong></div>
-            <ul className="draft-list">
-              {pairs.map(p => (
-                <li key={p.id} className={selectedPair?.id === p.id ? "selected" : ""} onClick={() => openPair(p.id)}>
-                  <div className="row1"><span className="ctx">{p.context || "(no context)"}</span></div>
-                  <div className="row2"><span>#{p.id}</span><span className="tags">{p.tags.join(", ")}</span><span className="when">{shortWhen(p.created_at)}</span></div>
+      {view() === "library" && (
+        <div class="library-layout">
+          <aside class="list-pane">
+            <div class="list-head"><strong>Pairs ({pairs().length})</strong></div>
+            <ul class="draft-list">
+              <For each={pairs()}>{(p) => (
+                <li class={selectedPair()?.id === p.id ? "selected" : ""} onClick={() => openPair(p.id)}>
+                  <div class="row1"><span class="ctx">{p.context || "(no context)"}</span></div>
+                  <div class="row2"><span>#{p.id}</span><span class="tags">{p.tags.join(", ")}</span><span class="when">{shortWhen(p.created_at)}</span></div>
                 </li>
-              ))}
-              {pairs.length === 0 && <li className="empty">No pairs yet. Finalize a draft to create one.</li>}
+              )}</For>
+              {pairs().length === 0 && <li class="empty">No pairs yet. Finalize a draft to create one.</li>}
             </ul>
           </aside>
-          <section className="editor-pane pair-detail">
-            {selectedPair ? <PairDetail pair={selectedPair} onDelete={deletePair} /> : <div className="empty-editor">Select a pair.</div>}
+          <section class="editor-pane pair-detail">
+            {selectedPair() ? <PairDetail pair={selectedPair()!} onDelete={deletePair} /> : <div class="empty-editor">Select a pair.</div>}
           </section>
-          <aside className="right-pane">
-            <div className="right-tabs"><button className="active">Lessons</button></div>
-            <div className="right-body">
-              <LessonsPane lessons={lessons} pairId={selectedPair?.id ?? null} onChanged={reloadLibrary} onDeleteLesson={deleteLesson} />
+          <aside class="right-pane">
+            <div class="right-tabs"><button class="active">Lessons</button></div>
+            <div class="right-body">
+              <LessonsPane lessons={lessons()} pairId={selectedPair()?.id ?? null} onChanged={reloadLibrary} onDeleteLesson={deleteLesson} />
             </div>
           </aside>
         </div>
       )}
 
-      {view === "lessons" && (
-        <div className="search-layout">
+      {view() === "lessons" && (
+        <div class="search-layout">
           <section>
-            <h3>All lessons ({lessons.length})</h3>
-            <ul className="lesson-list">
-              {lessons.map(l => (
-                <li key={l.id}>
-                  <div className="lesson-row">
-                    <div className="lesson-text">
+            <h3>All lessons ({lessons().length})</h3>
+            <ul class="lesson-list">
+              <For each={lessons()}>{(l) => (
+                <li>
+                  <div class="lesson-row">
+                    <div class="lesson-text">
                       <div>{l.lesson}</div>
-                      <div className="lesson-meta">L{l.id} · pair #{l.pair_id ?? "—"} · [{l.tags.join(", ")}]</div>
+                      <div class="lesson-meta">L{l.id} · pair #{l.pair_id ?? "—"} · [{l.tags.join(", ")}]</div>
                     </div>
                     <ConfirmButton label="Delete" confirmLabel="Confirm" danger onConfirm={() => deleteLesson(l.id)} />
                   </div>
                 </li>
-              ))}
-              {lessons.length === 0 && <li className="empty">No lessons yet. Derive one from a pair's diff.</li>}
+              )}</For>
+              {lessons().length === 0 && <li class="empty">No lessons yet. Derive one from a pair's diff.</li>}
             </ul>
           </section>
         </div>
       )}
 
-      {view === "search" && (
-        <div className="search-layout">
-          {results == null ? (
-            <div className="empty-editor">Search across every draft, revision, pair, and lesson. Start with the box above.</div>
+      {view() === "search" && (
+        <div class="search-layout">
+          {results() == null ? (
+            <div class="empty-editor">Search across every draft, revision, pair, and lesson. Start with the box above.</div>
           ) : (
             <>
               <section>
-                <h3>Drafts ({results.drafts.length})</h3>
-                <ul className="result-list">{results.drafts.map(d => <li key={d.id}><b>#{d.id}</b> {d.context || "(no context)"} — {d.tags.join(", ")}</li>)}</ul>
+                <h3>Drafts ({results()!.drafts.length})</h3>
+                <ul class="result-list"><For each={results()!.drafts}>{(d) => <li><b>#{d.id}</b> {d.context || "(no context)"} — {d.tags.join(", ")}</li>}</For></ul>
               </section>
               <section>
-                <h3>Pairs ({results.pairs.length})</h3>
-                <ul className="result-list">{results.pairs.map(p => <li key={p.id}><b>#{p.id}</b> {p.context || ""} — {p.tags.join(", ")}</li>)}</ul>
+                <h3>Pairs ({results()!.pairs.length})</h3>
+                <ul class="result-list"><For each={results()!.pairs}>{(p) => <li><b>#{p.id}</b> {p.context || ""} — {p.tags.join(", ")}</li>}</For></ul>
               </section>
               <section>
-                <h3>Lessons ({results.lessons.length})</h3>
-                <ul className="result-list">{results.lessons.map(l => <li key={l.id}>{l.lesson} <i>[{l.tags.join(", ")}]</i></li>)}</ul>
+                <h3>Lessons ({results()!.lessons.length})</h3>
+                <ul class="result-list"><For each={results()!.lessons}>{(l) => <li>{l.lesson} <i>[{l.tags.join(", ")}]</i></li>}</For></ul>
               </section>
             </>
           )}
         </div>
       )}
 
-      {view === "patterns" && (
-        <PatternsView patterns={patterns} onChanged={reloadPatterns} />
+      {view() === "patterns" && (
+        <PatternsView patterns={patterns()} onChanged={reloadPatterns} />
       )}
 
-      {view === "feedback" && (
-        <FeedbackView feedback={feedback} />
+      {view() === "feedback" && (
+        <FeedbackView feedback={feedback()} />
       )}
     </div>
   );
 }
 
-function DiffPane({ diff, oldText, newText }: { diff: string; oldText?: string; newText?: string }) {
-  const [mode, setMode] = useState<"lines" | "sentences" | "split">("lines");
-  const [sentenceDiff, setSentenceDiff] = useState<string>("");
+function DiffPane(props: { diff: string; oldText?: string; newText?: string }) {
+  const [mode, setMode] = createSignal<"lines" | "sentences" | "split">("lines");
+  const [sentenceDiff, setSentenceDiff] = createSignal<string>("");
 
-  useEffect(() => {
-    if (mode === "sentences" && oldText != null && newText != null) {
-      api.computeDiff(oldText, newText, "sentences").then(setSentenceDiff).catch(() => setSentenceDiff(""));
+  createEffect(on([() => mode(), () => props.oldText, () => props.newText], () => {
+    if (mode() === "sentences" && props.oldText != null && props.newText != null) {
+      api.computeDiff(props.oldText, props.newText, "sentences").then(setSentenceDiff).catch(() => setSentenceDiff(""));
     }
-  }, [mode, oldText, newText]);
+  }));
 
-  const activeDiff = mode === "sentences" ? sentenceDiff : diff;
-  const rows = parseDiff(activeDiff);
-  const hasChanges = rows.some(r => r.kind !== "equal");
+  const rows = createMemo(() => parseDiff(mode() === "sentences" ? sentenceDiff() : props.diff));
+  const hasChanges = createMemo(() => rows().some(r => r.kind !== "equal"));
 
   const modes = (
-    <div className="diff-mode">
-      <button className={mode === "lines" ? "active" : ""} onClick={() => setMode("lines")}>lines</button>
-      <button className={mode === "sentences" ? "active" : ""} onClick={() => setMode("sentences")}>sentences</button>
-      <button className={mode === "split" ? "active" : ""} onClick={() => setMode("split")}>side-by-side</button>
+    <div class="diff-mode">
+      <button class={mode() === "lines" ? "active" : ""} onClick={() => setMode("lines")}>lines</button>
+      <button class={mode() === "sentences" ? "active" : ""} onClick={() => setMode("sentences")}>sentences</button>
+      <button class={mode() === "split" ? "active" : ""} onClick={() => setMode("split")}>side-by-side</button>
     </div>
   );
 
-  if (!hasChanges) {
-    return (
-      <div className="diff-pane">
-        {modes}
-        <div className="empty small">No changes yet — the editor matches the original draft.</div>
-      </div>
-    );
-  }
-
-  if (mode === "split") {
-    return (
-      <div className="diff-pane">
-        {modes}
-        <div className="diff-split">
-          <div className="diff-split-col">
-            <div className="diff-split-head del">Removed</div>
-            <pre className="diff">
-              {rows.map((row, i) => row.kind === "removed" ? <DiffLine key={i} row={row} /> : null)}
+  return (
+    <div class="diff-pane">
+      {modes}
+      {!hasChanges() ? (
+        <div class="empty small">No changes yet — the editor matches the original draft.</div>
+      ) : mode() === "split" ? (
+        <div class="diff-split">
+          <div class="diff-split-col">
+            <div class="diff-split-head del">Removed</div>
+            <pre class="diff">
+              <For each={rows().filter(r => r.kind === "removed")}>{(row) => <DiffLine row={row} />}</For>
             </pre>
           </div>
-          <div className="diff-split-col">
-            <div className="diff-split-head add">Added</div>
-            <pre className="diff">
-              {rows.map((row, i) => row.kind === "added" ? <DiffLine key={i} row={row} /> : null)}
+          <div class="diff-split-col">
+            <div class="diff-split-head add">Added</div>
+            <pre class="diff">
+              <For each={rows().filter(r => r.kind === "added")}>{(row) => <DiffLine row={row} />}</For>
             </pre>
           </div>
         </div>
-      </div>
-    );
-  }
-
-  return (
-    <div className="diff-pane">
-      {modes}
-      <pre className="diff">
-        {rows.map((row, i) => <DiffLine key={i} row={row} />)}
-      </pre>
-    </div>
-  );
-}
-
-function DiffLine({ row }: { row: DiffRow }) {
-  const cls = row.kind === "added" ? "add" : row.kind === "removed" ? "del" : "ctx";
-  const sign = row.kind === "added" ? "+" : row.kind === "removed" ? "-" : " ";
-  return (
-    <div className={"diff-line " + cls}>
-      <span className="sign">{sign}</span>
-      {row.segments.map((s, i) =>
-        s.tag === "ctx"
-          ? <span key={i} className="seg">{s.text}</span>
-          : <span key={i} className={"seg hl " + s.tag}>{s.text}</span>
+      ) : (
+        <pre class="diff">
+          <For each={rows()}>{(row) => <DiffLine row={row} />}</For>
+        </pre>
       )}
     </div>
   );
 }
 
-function ConfirmButton({ label, confirmLabel, onConfirm, danger }: {
-  label: string;
-  confirmLabel: string;
-  onConfirm: () => void;
-  danger?: boolean;
-}) {
-  const [armed, setArmed] = useState(false);
-  const timer = useRef<number | null>(null);
-  useEffect(() => () => { if (timer.current) window.clearTimeout(timer.current); }, []);
-  const disarm = () => {
-    setArmed(false);
-    if (timer.current) { window.clearTimeout(timer.current); timer.current = null; }
-  };
-  if (!armed) {
-    return (
-      <button className={danger ? "danger" : "primary"} onClick={() => {
-        setArmed(true);
-        timer.current = window.setTimeout(() => setArmed(false), 4000);
-      }}>{label}</button>
-    );
-  }
+function DiffLine(props: { row: import("./lib/api").DiffRow }) {
+  const cls = () => props.row.kind === "added" ? "add" : props.row.kind === "removed" ? "del" : "ctx";
+  const sign = () => props.row.kind === "added" ? "+" : props.row.kind === "removed" ? "-" : " ";
   return (
-    <span className="confirm-group">
-      <button onClick={disarm}>Cancel</button>
-      <button className={danger ? "danger" : "primary"} onClick={() => { disarm(); onConfirm(); }}>{confirmLabel}</button>
-    </span>
+    <div class={"diff-line " + cls()}>
+      <span class="sign">{sign()}</span>
+      <For each={props.row.segments}>{(s) =>
+        s.tag === "ctx" ? <span class="seg">{s.text}</span> : <span class={"seg hl " + s.tag}>{s.text}</span>
+      }</For>
+    </div>
   );
 }
 
-function RevisionsPane({ revisions, onRestore }: {
-  revisions: DraftWithRevisions["revisions"]; onRestore: (id: number) => void;
-}) {
+function ConfirmButton(props: { label: string; confirmLabel: string; onConfirm: () => void; danger?: boolean }) {
+  const [armed, setArmed] = createSignal(false);
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  onCleanup(() => { if (timer) clearTimeout(timer); });
+  const disarm = () => {
+    setArmed(false);
+    if (timer) { clearTimeout(timer); timer = null; }
+  };
   return (
-    <ul className="rev-list">
-      {revisions.slice().reverse().map((r, i) => (
-        <li key={r.id} className={i === 0 ? "latest" : ""}>
-          <div className="rev-head">
-            <span className={"rev-src " + r.source}>{r.source}</span>
-            <span className="when">{shortWhen(r.created_at)}</span>
+    <>
+      {!armed() ? (
+        <button class={props.danger ? "danger" : "primary"} onClick={() => {
+          setArmed(true);
+          timer = setTimeout(() => setArmed(false), 4000);
+        }}>{props.label}</button>
+      ) : (
+        <span class="confirm-group">
+          <button onClick={disarm}>Cancel</button>
+          <button class={props.danger ? "danger" : "primary"} onClick={() => { disarm(); props.onConfirm(); }}>{props.confirmLabel}</button>
+        </span>
+      )}
+    </>
+  );
+}
+
+function RevisionsPane(props: { revisions: DraftWithRevisions["revisions"]; onRestore: (id: number) => void }) {
+  const reversed = createMemo(() => [...props.revisions].reverse());
+  return (
+    <ul class="rev-list">
+      <For each={reversed()}>{(r, i) => (
+        <li class={i() === 0 ? "latest" : ""}>
+          <div class="rev-head">
+            <span class={"rev-src " + r.source}>{r.source}</span>
+            <span class="when">{shortWhen(r.created_at)}</span>
             <span>rev #{r.id}</span>
-            {i !== 0 && <button className="mini" onClick={() => onRestore(r.id)}>restore</button>}
+            {i() !== 0 && <button class="mini" onClick={() => props.onRestore(r.id)}>restore</button>}
           </div>
-          <pre className="rev-preview">{truncate(r.content, 160)}</pre>
+          <pre class="rev-preview">{truncate(r.content, 160)}</pre>
         </li>
-      ))}
+      )}</For>
     </ul>
   );
 }
 
-function LessonsPane({ lessons, pairId, onChanged, onDeleteLesson }: {
+function LessonsPane(props: {
   lessons: Lesson[]; pairId: number | null; onChanged: () => void; onDeleteLesson: (id: number) => void;
 }) {
-  const [text, setText] = useState("");
-  const [tagsStr, setTagsStr] = useState("");
+  const [text, setText] = createSignal("");
+  const [tagsStr, setTagsStr] = createSignal("");
   // pair-scoped: only lessons derived from this pair, not the whole corpus.
   // Use the All Lessons tab to see every lesson.
-  const shown = pairId == null ? [] : lessons.filter(l => l.pair_id === pairId);
+  const shown = createMemo(() => props.pairId == null ? [] : props.lessons.filter(l => l.pair_id === props.pairId));
   const add = async () => {
-    if (pairId == null || !text.trim()) return;
-    const tags = tagsStr.split(",").map(t => t.trim()).filter(Boolean);
-    await api.addLesson(pairId, text.trim(), tags);
+    if (props.pairId == null || !text().trim()) return;
+    const tags = tagsStr().split(",").map(t => t.trim()).filter(Boolean);
+    await api.addLesson(props.pairId, text().trim(), tags);
     setText(""); setTagsStr("");
-    onChanged();
+    props.onChanged();
   };
   return (
-    <div className="lessons">
-      <ul className="lesson-list">
-        {shown.map(l => (
-          <li key={l.id}>
-            <div className="lesson-row">
-              <div className="lesson-text">
+    <div class="lessons">
+      <ul class="lesson-list">
+        <For each={shown()}>{(l) => (
+          <li>
+            <div class="lesson-row">
+              <div class="lesson-text">
                 <div>{l.lesson}</div>
-                <div className="lesson-meta">L{l.id} · pair #{l.pair_id ?? "—"} · [{l.tags.join(", ")}]</div>
+                <div class="lesson-meta">L{l.id} · pair #{l.pair_id ?? "—"} · [{l.tags.join(", ")}]</div>
               </div>
-              <ConfirmButton label="Delete" confirmLabel="Confirm" danger onConfirm={() => onDeleteLesson(l.id)} />
+              <ConfirmButton label="Delete" confirmLabel="Confirm" danger onConfirm={() => props.onDeleteLesson(l.id)} />
             </div>
           </li>
-        ))}
-        {shown.length === 0 && pairId != null && <li className="empty small">No lessons for this pair yet. Derive one from the diff and add it here.</li>}
+        )}</For>
+        {shown().length === 0 && props.pairId != null && <li class="empty small">No lessons for this pair yet. Derive one from the diff and add it here.</li>}
       </ul>
-      <div className="add-lesson">
-        <textarea value={text} onChange={e => setText(e.target.value)} placeholder="a specific lesson (e.g. ‘use quick note, not I wanted to reach out’)" rows={2} />
-        <div className="add-row">
-          <input value={tagsStr} onChange={e => setTagsStr(e.target.value)} placeholder="tags: pitch, external" />
-          <button className="primary" onClick={add} disabled={pairId == null || !text.trim()}>Add lesson</button>
+      <div class="add-lesson">
+        <textarea value={text()} onInput={e => setText(e.currentTarget.value)} placeholder="a specific lesson (e.g. ‘use quick note, not I wanted to reach out’)" rows={2} />
+        <div class="add-row">
+          <input value={tagsStr()} onInput={e => setTagsStr(e.currentTarget.value)} placeholder="tags: pitch, external" />
+          <button class="primary" onClick={add} disabled={props.pairId == null || !text().trim()}>Add lesson</button>
         </div>
-        {pairId == null && <div className="hint">Finalize a draft to attach a lesson to its pair.</div>}
+        {props.pairId == null && <div class="hint">Finalize a draft to attach a lesson to its pair.</div>}
       </div>
     </div>
   );
 }
 
-function PairDetail({ pair, onDelete }: { pair: Pair; onDelete: (id: number) => void }) {
+function PairDetail(props: { pair: Pair; onDelete: (id: number) => void }) {
   return (
-    <div className="pair-detail-inner">
-      <div className="meta-row">
-        <h3>Pair #{pair.id} {pair.context && <span className="muted">— {pair.context}</span>}</h3>
-        <ConfirmButton label="Delete" confirmLabel="Confirm delete" danger onConfirm={() => onDelete(pair.id)} />
+    <div class="pair-detail-inner">
+      <div class="meta-row">
+        <h3>Pair #{props.pair.id} {props.pair.context && <span class="muted">— {props.pair.context}</span>}</h3>
+        <ConfirmButton label="Delete" confirmLabel="Confirm delete" danger onConfirm={() => props.onDelete(props.pair.id)} />
       </div>
-      <div className="pair-tags">{pair.tags.join(", ")}</div>
-      <div className="pair-cols">
-        <div><h4>Draft</h4><pre>{pair.draft}</pre></div>
-        <div><h4>Final</h4><pre>{pair.final}</pre></div>
+      <div class="pair-tags">{props.pair.tags.join(", ")}</div>
+      <div class="pair-cols">
+        <div><h4>Draft</h4><pre>{props.pair.draft}</pre></div>
+        <div><h4>Final</h4><pre>{props.pair.final}</pre></div>
       </div>
-      <DeletionsSection pairId={pair.id} />
+      <DeletionsSection pairId={props.pair.id} />
       <h4>Diff</h4>
-      <DiffPane diff={pair.diff} oldText={pair.draft} newText={pair.final} />
+      <DiffPane diff={props.pair.diff} oldText={props.pair.draft} newText={props.pair.final} />
     </div>
   );
 }
@@ -630,75 +612,75 @@ function truncate(s: string, n: number): string {
 
 // Surfaces deletions and categorized changes above the raw diff so the user
 // sees the voice signal first, not the line-level noise.
-function DeletionsSection({ pairId }: { pairId: number }) {
-  const [analysis, setAnalysis] = useState<DiffAnalysis | null>(null);
+function DeletionsSection(props: { pairId: number }) {
+  const [analysis, setAnalysis] = createSignal<DiffAnalysis | null>(null);
 
-  useEffect(() => {
+  createEffect(on(() => props.pairId, (pairId) => {
     api.analyzePair(pairId).then(setAnalysis).catch(() => setAnalysis(null));
-  }, [pairId]);
-
-  if (!analysis) return null;
-  const deletions = analysis.deletions;
-  const categorized = analysis.categorized || [];
-  const noSignal = deletions.length === 0 && categorized.length === 0;
-  if (noSignal) return null;
+  }));
 
   return (
-    <div className="analysis-section">
-      {deletions.length > 0 && (
-        <>
-          <h4 className="signal-head">✂ Deletions ({deletions.length})</h4>
-          <ul className="signal-list">
-            {deletions.map((d, i) => (
-              <li key={i} className="signal-item del">{d}</li>
-            ))}
-          </ul>
-        </>
-      )}
-      {categorized.length > 0 && (
-        <>
-          <h4 className="signal-head">Categorized changes</h4>
-          <ul className="cat-list">
-            {categorized.map((c, i) => (
-              <li key={i} className={"cat-item " + c.category}>
-                <span className={"cat-badge " + c.category}>{c.category}</span>
-                <span className="cat-desc">{c.description}</span>
-              </li>
-            ))}
-          </ul>
-        </>
-      )}
-    </div>
+    <Show when={analysis()} keyed>
+      {(a) => {
+        const deletions = a.deletions;
+        const categorized = a.categorized || [];
+        const noSignal = deletions.length === 0 && categorized.length === 0;
+        if (noSignal) return <></>;
+        return (
+          <div class="analysis-section">
+            {deletions.length > 0 && (
+              <>
+                <h4 class="signal-head">✂ Deletions ({deletions.length})</h4>
+                <ul class="signal-list">
+                  <For each={deletions}>{(d) => <li class="signal-item del">{d}</li>}</For>
+                </ul>
+              </>
+            )}
+            {categorized.length > 0 && (
+              <>
+                <h4 class="signal-head">Categorized changes</h4>
+                <ul class="cat-list">
+                  <For each={categorized}>{(c) => (
+                    <li class={"cat-item " + c.category}>
+                      <span class={"cat-badge " + c.category}>{c.category}</span>
+                      <span class="cat-desc">{c.description}</span>
+                    </li>
+                  )}</For>
+                </ul>
+              </>
+            )}
+          </div>
+        );
+      }}
+    </Show>
   );
 }
 
 // --- lint panel (drafts right-pane) ---
 
-function LintPane({ violations, linting, onRelint }: {
-  violations: Violation[]; linting: boolean; onRelint: () => void;
-}) {
+function LintPane(props: { violations: Violation[]; linting: boolean; onRelint: () => void }) {
   return (
-    <div className="lint-pane">
-      <div className="lint-head">
-        <strong>{violations.length} violation(s)</strong>
-        <button className="mini" onClick={onRelint} disabled={linting}>
-          {linting ? "linting…" : "re-lint"}
+    <div class="lint-pane">
+      <div class="lint-head">
+        <strong>{props.violations.length} violation(s)</strong>
+        <button class="mini" onClick={props.onRelint} disabled={props.linting}>
+          {props.linting ? "linting…" : "re-lint"}
         </button>
       </div>
-      {violations.length === 0 ? (
-        <div className="empty small">
-          {linting ? "Checking…" : "No violations. Draft matches all stored patterns."}
+      {props.violations.length === 0 ? (
+        <div class="empty small">
+          {props.linting ? "Checking…" : "No violations. Draft matches all stored patterns."}
         </div>
       ) : (
-        <ul className="violation-list">
-          {violations.map((v, i) => (
-            <li key={i} className={"violation " + v.category}>
-              <div className="v-rule">⚠ {v.rule}</div>
-              {v.matched_text && <div className="v-match">"{v.matched_text}" — line {v.line}</div>}
-              <div className="v-ctx">{v.context}</div>
-              <div className="v-meta">[{v.category}] {v.direction}</div>
+        <ul class="violation-list">
+          <For each={props.violations}>{(v) => (
+            <li class={"violation " + v.category}>
+              <div class="v-rule">⚠ {v.rule}</div>
+              {v.matched_text && <div class="v-match">"{v.matched_text}" — line {v.line}</div>}
+              <div class="v-ctx">{v.context}</div>
+              <div class="v-meta">[{v.category}] {v.direction}</div>
             </li>
-          ))}
+          )}</For>
         </ul>
       )}
     </div>
@@ -707,76 +689,74 @@ function LintPane({ violations, linting, onRelint }: {
 
 // --- patterns management view ---
 
-function PatternsView({ patterns, onChanged }: {
-  patterns: Pattern[]; onChanged: () => void;
-}) {
-  const [rule, setRule] = useState("");
-  const [pattern, setPattern] = useState("");
-  const [patternType, setPatternType] = useState("literal");
-  const [direction, setDirection] = useState("avoid");
-  const [category, setCategory] = useState("style");
+function PatternsView(props: { patterns: Pattern[]; onChanged: () => void }) {
+  const [rule, setRule] = createSignal("");
+  const [pattern, setPattern] = createSignal("");
+  const [patternType, setPatternType] = createSignal("literal");
+  const [direction, setDirection] = createSignal("avoid");
+  const [category, setCategory] = createSignal("style");
 
   const add = async () => {
-    if (!rule.trim() || !pattern.trim()) return;
-    await api.addPattern(rule.trim(), pattern.trim(), patternType, direction, category, null, null, null);
+    if (!rule().trim() || !pattern().trim()) return;
+    await api.addPattern(rule().trim(), pattern().trim(), patternType(), direction(), category(), null, null, null);
     setRule(""); setPattern("");
-    onChanged();
+    props.onChanged();
   };
 
   const del = async (id: number) => {
     await api.deletePattern(id);
-    onChanged();
+    props.onChanged();
   };
 
   return (
-    <div className="search-layout">
-      <section className="pattern-list-section">
-        <h3>Voice patterns ({patterns.length})</h3>
-        <p className="hint">Patterns are matchable rules the lint engine checks drafts against.
+    <div class="search-layout">
+      <section class="pattern-list-section">
+        <h3>Voice patterns ({props.patterns.length})</h3>
+        <p class="hint">Patterns are matchable rules the lint engine checks drafts against.
         Literal matches are case-insensitive substring searches. Regex uses Rust regex syntax.</p>
-        <ul className="pattern-list">
-          {patterns.map(p => (
-            <li key={p.id}>
-              <div className="pattern-row">
-                <div className="pattern-text">
+        <ul class="pattern-list">
+          <For each={props.patterns}>{(p) => (
+            <li>
+              <div class="pattern-row">
+                <div class="pattern-text">
                   <div><strong>{p.rule}</strong></div>
-                  <div className="pattern-meta">
+                  <div class="pattern-meta">
                     <code>{p.pattern}</code> · {p.pattern_type} · {p.direction} · [{p.category}] · {p.confidence}
                   </div>
                   {p.before_text && p.after_text && (
-                    <div className="pattern-ex">
-                      <span className="del">{p.before_text}</span> → <span className="add">{p.after_text}</span>
+                    <div class="pattern-ex">
+                      <span class="del">{p.before_text}</span> → <span class="add">{p.after_text}</span>
                     </div>
                   )}
                 </div>
                 <ConfirmButton label="Delete" confirmLabel="Confirm" danger onConfirm={() => del(p.id)} />
               </div>
             </li>
-          ))}
-          {patterns.length === 0 && <li className="empty">No patterns yet. Add one below — it will immediately lint future drafts.</li>}
+          )}</For>
+          {props.patterns.length === 0 && <li class="empty">No patterns yet. Add one below — it will immediately lint future drafts.</li>}
         </ul>
       </section>
-      <section className="add-pattern-section">
+      <section class="add-pattern-section">
         <h3>Add pattern</h3>
-        <input value={rule} onChange={e => setRule(e.target.value)} placeholder="Rule: e.g. No em-dashes in client emails" />
-        <input value={pattern} onChange={e => setPattern(e.target.value)} placeholder="Pattern: e.g. — or \b—\b" />
-        <div className="pattern-opts">
-          <select value={patternType} onChange={e => setPatternType(e.target.value)}>
+        <input value={rule()} onInput={e => setRule(e.currentTarget.value)} placeholder="Rule: e.g. No em-dashes in client emails" />
+        <input value={pattern()} onInput={e => setPattern(e.currentTarget.value)} placeholder="Pattern: e.g. — or \b—\b" />
+        <div class="pattern-opts">
+          <select value={patternType()} onChange={e => setPatternType(e.currentTarget.value)}>
             <option value="literal">literal</option>
             <option value="regex">regex</option>
           </select>
-          <select value={direction} onChange={e => setDirection(e.target.value)}>
+          <select value={direction()} onChange={e => setDirection(e.currentTarget.value)}>
             <option value="avoid">avoid</option>
             <option value="prefer">prefer</option>
           </select>
-          <select value={category} onChange={e => setCategory(e.target.value)}>
+          <select value={category()} onChange={e => setCategory(e.currentTarget.value)}>
             <option value="style">style</option>
             <option value="punctuation">punctuation</option>
             <option value="structure">structure</option>
             <option value="factual">factual</option>
             <option value="deletion">deletion</option>
           </select>
-          <button className="primary" onClick={add} disabled={!rule.trim() || !pattern.trim()}>Add</button>
+          <button class="primary" onClick={add} disabled={!rule().trim() || !pattern().trim()}>Add</button>
         </div>
       </section>
     </div>
@@ -785,28 +765,28 @@ function PatternsView({ patterns, onChanged }: {
 
 // --- feedback view ---
 
-function FeedbackView({ feedback }: { feedback: Feedback[] }) {
+function FeedbackView(props: { feedback: Feedback[] }): JSX.Element {
   return (
-    <div className="search-layout">
+    <div class="search-layout">
       <section>
-        <h3>Feedback ({feedback.length})</h3>
-        <p className="hint">Agents log feedback via the <code>give_feedback</code> MCP tool or <code>redline feedback</code> CLI command.</p>
-        {feedback.length === 0 ? (
-          <div className="empty">No feedback yet.</div>
+        <h3>Feedback ({props.feedback.length})</h3>
+        <p class="hint">Agents log feedback via the <code>give_feedback</code> MCP tool or <code>redline feedback</code> CLI command.</p>
+        {props.feedback.length === 0 ? (
+          <div class="empty">No feedback yet.</div>
         ) : (
-          <ul className="feedback-list">
-            {feedback.map(f => (
-              <li key={f.id} className={"feedback-item " + f.severity}>
-                <div className="fb-head">
-                  <span className={"sev " + f.severity}>{f.severity}</span>
-                  {f.tool_name && <span className="fb-tool">{f.tool_name}</span>}
-                  {f.rating != null && <span className="fb-rating">{"★".repeat(f.rating)}{"☆".repeat(5 - f.rating)}</span>}
-                  <span className="when">{shortWhen(f.created_at)}</span>
+          <ul class="feedback-list">
+            <For each={props.feedback}>{(f) => (
+              <li class={"feedback-item " + f.severity}>
+                <div class="fb-head">
+                  <span class={"sev " + f.severity}>{f.severity}</span>
+                  {f.tool_name && <span class="fb-tool">{f.tool_name}</span>}
+                  {f.rating != null && <span class="fb-rating">{"★".repeat(f.rating)}{"☆".repeat(5 - f.rating)}</span>}
+                  <span class="when">{shortWhen(f.created_at)}</span>
                 </div>
-                <div className="fb-msg">{f.message}</div>
-                {f.agent_id && <div className="fb-agent">from: {f.agent_id}</div>}
+                <div class="fb-msg">{f.message}</div>
+                {f.agent_id && <div class="fb-agent">from: {f.agent_id}</div>}
               </li>
-            ))}
+            )}</For>
           </ul>
         )}
       </section>
