@@ -136,6 +136,9 @@ enum Cmd {
     },
     /// List all feedback entries.
     FeedbackList,
+    /// Manually trigger pattern promotion. Scans all pairs, auto-promotes
+    /// patterns with 3+ draft occurrences to 'confirmed'.
+    Promote,
 }
 
 fn read_text(path: &PathBuf) -> anyhow::Result<String> {
@@ -220,12 +223,20 @@ fn run() -> anyhow::Result<()> {
 
         Cmd::Draft { path, context, tags, source } => {
             let body = read_text(&path)?;
-            let id = el::create_draft(&conn, &body, context.as_deref(), &tags, &source)?;
-            println!("{id}");
+            let ctx = el::create_draft_with_context(&conn, &body, context.as_deref(), &tags, &source)?;
+            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                "draft_id": ctx.draft_id,
+                "patterns": ctx.patterns,
+                "violations": ctx.violations,
+            }))?);
         }
         Cmd::Finalize { draft_id } => {
-            let pair_id = el::finalize_draft(&conn, draft_id)?;
-            println!("{pair_id}");
+            let result = el::finalize_draft_with_analysis(&conn, draft_id)?;
+            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                "pair_id": result.pair_id,
+                "analysis": result.analysis,
+                "promoted_patterns": result.promoted_patterns,
+            }))?);
         }
         Cmd::Drafts { all } => {
             let out = el::list_drafts(&conn, all)?;
@@ -287,6 +298,16 @@ fn run() -> anyhow::Result<()> {
         Cmd::FeedbackList => {
             let out = el::list_feedback(&conn)?;
             println!("{}", serde_json::to_string_pretty(&out)?);
+        }
+        Cmd::Promote => {
+            let promoted = el::promote_patterns(&conn)?;
+            if promoted.is_empty() {
+                println!("No patterns promoted.");
+            } else {
+                for (id, rule, count, pairs) in &promoted {
+                    println!("promoted #{id} \"{rule}\" — {count} occurrences in pairs {:?}", pairs);
+                }
+            }
         }
         Cmd::Mcp => {
             // The MCP server speaks JSON-RPC over stdio and needs the tokio

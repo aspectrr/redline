@@ -596,6 +596,33 @@ pub fn create_draft(
     Ok(draft_id)
 }
 
+/// Rich result from create_draft with patterns to respect + lint violations.
+/// This is the write-loop injection point: the agent gets back everything it
+/// needs to adjust the draft before the user sees it.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct DraftContext {
+    pub draft_id: i64,
+    /// All stored voice patterns the agent should respect.
+    pub patterns: Vec<Pattern>,
+    /// Lint violations found in the just-created content.
+    pub violations: Vec<Violation>,
+}
+
+/// Create a draft AND return the patterns + lint violations so the agent can
+/// adjust immediately. This is the main entry point for agents.
+pub fn create_draft_with_context(
+    conn: &Connection,
+    content: &str,
+    context: Option<&str>,
+    tags: &[String],
+    source: &str,
+) -> anyhow::Result<DraftContext> {
+    let draft_id = create_draft(conn, content, context, tags, source)?;
+    let patterns = list_patterns(conn, None)?;
+    let violations = lint_draft(conn, content)?;
+    Ok(DraftContext { draft_id, patterns, violations })
+}
+
 pub fn list_drafts(conn: &Connection, include_finalized: bool) -> anyhow::Result<Vec<Draft>> {
     let sql = if include_finalized {
         "SELECT id, context, tags, status, finalized_pair_id, created_at, updated_at
@@ -768,6 +795,46 @@ pub fn delete_pattern(conn: &Connection, pattern_id: i64) -> anyhow::Result<()> 
     Ok(())
 }
 
+/// Check if a pattern matches anywhere in text.
+fn pattern_matches(pat: &Pattern, text: &str) -> bool {
+    match pat.pattern_type.as_str() {
+        "regex" => regex::Regex::new(&pat.pattern).map(|r| r.is_match(text)).unwrap_or(false),
+        _ => text.to_lowercase().contains(&pat.pattern.to_lowercase()),
+    }
+}
+
+/// Count how many pairs' drafts contain this pattern. Returns (pair_count, pair_ids).
+fn count_pattern_in_pairs(conn: &Connection, pat: &Pattern) -> anyhow::Result<(usize, Vec<i64>)> {
+    let pairs = all_pairs_asc(conn)?;
+    let hits: Vec<i64> = pairs.iter()
+        .filter(|p| pattern_matches(pat, &p.draft))
+        .map(|p| p.id)
+        .collect();
+    Ok((hits.len(), hits))
+}
+
+/// Scan all patterns against all pairs. For "avoid" patterns, count how many
+/// drafts contain the pattern. Auto-promote unconfirmed → confirmed at 3+.
+/// Returns (promoted_count, details) so callers can report what changed.
+pub fn promote_patterns(conn: &Connection) -> anyhow::Result<Vec<(i64, String, usize, Vec<i64>)>> {
+    let patterns = list_patterns(conn, None)?;
+    let mut promoted = Vec::new();
+    for pat in &patterns {
+        if pat.confidence == "confirmed" {
+            continue;
+        }
+        let (count, pair_ids) = count_pattern_in_pairs(conn, pat)?;
+        if count >= 3 {
+            conn.execute(
+                "UPDATE patterns SET confidence = 'confirmed' WHERE id = ?1",
+                params![pat.id],
+            )?;
+            promoted.push((pat.id, pat.rule.clone(), count, pair_ids));
+        }
+    }
+    Ok(promoted)
+}
+
 /// Scan draft content against all stored patterns. Returns violations for
 /// "avoid" patterns that matched and suggestions for "prefer" patterns that
 /// were absent.
@@ -794,7 +861,6 @@ pub fn lint_draft(conn: &Connection, content: &str) -> anyhow::Result<Vec<Violat
                 lower.match_indices(&needle)
                     .map(|(idx, _)| {
                         let line = content[..idx].matches('\n').count() + 1;
-                        // recover original-case matched text
                         let matched = &content[idx..idx + pat.pattern.len()];
                         (matched.to_string(), line)
                     })
@@ -997,9 +1063,28 @@ pub fn restore_revision(
     save_revision(conn, draft_id, &content, "restore")
 }
 
+/// Rich result from finalize: pair_id + analysis data + promoted patterns.
+/// The agent gets back everything it needs to derive lessons and patterns.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct FinalizeResult {
+    pub pair_id: i64,
+    pub analysis: DiffAnalysis,
+    pub promoted_patterns: Vec<(i64, String, usize, Vec<i64>)>,
+}
+
 /// Finalize: latest revision becomes the final, first revision is the agent's
-/// original, compute the diff, write a `pairs` row, link it. Returns the pair id.
+/// original, compute the diff, write a `pairs` row, link it. Then run
+/// occurrence-based promotion on all patterns. Returns analysis data.
 pub fn finalize_draft(conn: &Connection, draft_id: i64) -> anyhow::Result<i64> {
+    finalize_draft_impl(conn, draft_id).map(|r| r.pair_id)
+}
+
+/// Full finalize with analysis + promotion. This is the main entry point for agents.
+pub fn finalize_draft_with_analysis(conn: &Connection, draft_id: i64) -> anyhow::Result<FinalizeResult> {
+    finalize_draft_impl(conn, draft_id)
+}
+
+fn finalize_draft_impl(conn: &Connection, draft_id: i64) -> anyhow::Result<FinalizeResult> {
     let (draft_row, revisions) = match get_draft(conn, draft_id)? {
         Some(d) => (d.draft, d.revisions),
         None => anyhow::bail!("no draft with id {draft_id}"),
@@ -1020,7 +1105,22 @@ pub fn finalize_draft(conn: &Connection, draft_id: i64) -> anyhow::Result<i64> {
         "UPDATE drafts SET status = 'finalized', finalized_pair_id = ?1, updated_at = ?2 WHERE id = ?3",
         params![pair_id, now, draft_id],
     )?;
-    Ok(pair_id)
+
+    // Auto-promote patterns based on the new pair data
+    let promoted = promote_patterns(conn)?;
+
+    // Return the analysis so the agent can derive lessons immediately
+    let analysis = analyze_diff(conn, pair_id)?
+        .unwrap_or(DiffAnalysis {
+            pair_id,
+            deletions: vec![],
+            additions: vec![],
+            word_swaps: vec![],
+            draft_pattern_hits: vec![],
+            final_pattern_hits: vec![],
+        });
+
+    Ok(FinalizeResult { pair_id, analysis, promoted_patterns: promoted })
 }
 
 // ---------- search across everything ----------
@@ -1384,5 +1484,59 @@ mod tests {
         // at least one row should contain a complete sentence with punctuation
         assert!(changed_texts.iter().any(|t| t.contains('.') || t.contains('!') || t.contains('?')),
             "sentence diff rows should contain sentence-level text: {changed_texts:?}");
+    }
+
+    #[test]
+    fn create_draft_with_context_returns_patterns_and_violations() {
+        let path = tmp_db();
+        let conn = connect_at(&path).unwrap();
+        // seed a pattern
+        add_pattern(&conn, None, "No em-dashes", "—", "literal", "avoid", "punctuation", None, None).unwrap();
+
+        let ctx = create_draft_with_context(
+            &conn, "Hey — quick note.", Some("test"), &[], "agent",
+        ).unwrap();
+
+        assert!(ctx.draft_id > 0);
+        assert_eq!(ctx.patterns.len(), 1, "should return the stored pattern");
+        assert!(!ctx.violations.is_empty(), "should detect em-dash violation");
+        assert_eq!(ctx.violations[0].rule, "No em-dashes");
+    }
+
+    #[test]
+    fn finalize_with_analysis_returns_diff_data() {
+        let path = tmp_db();
+        let conn = connect_at(&path).unwrap();
+        let id = create_draft(&conn, "I wanted to reach out.\n", None, &[], "agent").unwrap();
+        save_revision(&conn, id, "Quick note.\n", "user").unwrap();
+
+        let result = finalize_draft_with_analysis(&conn, id).unwrap();
+        assert!(result.pair_id > 0);
+        assert!(!result.analysis.word_swaps.is_empty() || !result.analysis.deletions.is_empty(),
+            "analysis should surface the diff");
+    }
+
+    #[test]
+    fn promote_patterns_auto_confirms_at_three_occurrences() {
+        let path = tmp_db();
+        let conn = connect_at(&path).unwrap();
+        add_pattern(&conn, None, "No reach out", "reach out", "literal", "avoid", "style", None, None).unwrap();
+
+        // add 2 pairs with the pattern in the draft — not enough yet
+        add_pair(&conn, "I wanted to reach out.", "Quick note.", None, &[]).unwrap();
+        add_pair(&conn, "Going to reach out soon.", "Hi.", None, &[]).unwrap();
+        let promoted = promote_patterns(&conn).unwrap();
+        assert!(promoted.is_empty(), "should not promote at 2 occurrences");
+
+        // add a 3rd pair with the pattern — now promotes
+        add_pair(&conn, "Wanted to reach out again.", "Hello.", None, &[]).unwrap();
+        let promoted = promote_patterns(&conn).unwrap();
+        assert_eq!(promoted.len(), 1, "should promote at 3 occurrences");
+        assert_eq!(promoted[0].1, "No reach out");
+        assert_eq!(promoted[0].2, 3, "3 occurrences");
+
+        // verify confidence is now confirmed
+        let pats = list_patterns(&conn, None).unwrap();
+        assert_eq!(pats[0].confidence, "confirmed");
     }
 }

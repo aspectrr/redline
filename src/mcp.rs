@@ -156,15 +156,7 @@ struct UpdateDraftMetaParams {
     tags: Option<Vec<String>>,
 }
 
-// --- lint params ---
-
-#[derive(serde::Deserialize, schemars::JsonSchema)]
-struct LintParams {
-    /// Draft id to lint (uses latest revision content). If omitted, pass `content`.
-    draft_id: Option<i64>,
-    /// Raw text to lint directly. Used when draft_id is omitted.
-    content: Option<String>,
-}
+// --- pattern + analysis + feedback params ---
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 struct AddPatternParams {
@@ -326,14 +318,27 @@ impl EmailServer {
         })
     }
 
-    /// Push a new in-flight draft (agent ingest). Returns the draft id.
-    #[tool(description = "Create a new in-flight draft. The agent ingest path — it appears in the app for the user to edit. Returns the draft id.")]
+    /// Push a new in-flight draft (agent ingest). Returns the draft id PLUS
+    /// all stored voice patterns to respect and lint violations found in the
+    /// content. The agent should adjust the draft to resolve violations before
+    /// the user sees it.
+    #[tool(description = "Create a new in-flight draft. Returns the draft id, all voice patterns to respect, and lint violations in the content. Fix violations with save_revision before the user sees the draft. This is the main agent entry point — the returned patterns ARE the write loop.")]
     fn create_draft(&self, Parameters(p): Parameters<CreateDraftParams>) -> ToolResult {
         tool_op(|conn| {
             let tags = p.tags.unwrap_or_default();
             let source = p.source.as_deref().unwrap_or("agent");
-            let id = el::create_draft(conn, &p.content, p.context.as_deref(), &tags, source)?;
-            Ok(ok_json(serde_json::json!({ "draft_id": id })))
+            let ctx = el::create_draft_with_context(conn, &p.content, p.context.as_deref(), &tags, source)?;
+            Ok(ok_json(serde_json::json!({
+                "draft_id": ctx.draft_id,
+                "patterns": ctx.patterns,
+                "violations": ctx.violations,
+                "violation_count": ctx.violations.len(),
+                "next_step": if ctx.violations.is_empty() {
+                    "No violations. The draft is ready for the user to edit."
+                } else {
+                    "Fix the violations above with save_revision, then wait for the user to edit."
+                },
+            })))
         })
     }
 
@@ -371,13 +376,19 @@ impl EmailServer {
         })
     }
 
-    /// Save a new revision of a draft (append-only). source: "user" | "agent" | "restore".
-    #[tool(description = "Save a new revision of a draft (append-only — history is never destroyed). Returns the revision id.")]
+    /// Save a new revision of a draft (append-only). Returns the revision id
+    /// PLUS lint violations so the agent knows what still needs fixing.
+    #[tool(description = "Save a new revision of a draft (append-only — history is never destroyed). Returns the revision id and updated lint violations so the agent can see what's still wrong.")]
     fn save_revision(&self, Parameters(p): Parameters<SaveRevisionParams>) -> ToolResult {
         tool_op(|conn| {
             let source = p.source.as_deref().unwrap_or("user");
             let id = el::save_revision(conn, p.draft_id, &p.content, source)?;
-            Ok(ok_json(serde_json::json!({ "revision_id": id })))
+            let violations = el::lint_draft(conn, &p.content)?;
+            Ok(ok_json(serde_json::json!({
+                "revision_id": id,
+                "violations": violations,
+                "violation_count": violations.len(),
+            })))
         })
     }
 
@@ -392,11 +403,22 @@ impl EmailServer {
 
     /// Finalize a draft: latest revision becomes the final, the first revision
     /// is the original, the diff is stored as a pair. Returns the pair id.
-    #[tool(description = "Finalize a draft: stores a (original → latest) pair for learning and marks the draft finalized. Returns the pair id.")]
+    /// Finalize: stores a (original → latest) pair, marks the draft finalized,
+    /// auto-promotes patterns based on occurrence count, and returns the diff
+    /// analysis so the agent can derive lessons immediately.
+    #[tool(description = "Finalize a draft: stores a (original → edited) pair for learning and marks the draft finalized. Returns the pair id, diff analysis (deletions, additions, word swaps, pattern hits), and any patterns that were auto-promoted to confirmed. Derive voice lessons from the analysis and store them with add_lesson.")]
     fn finalize_draft(&self, Parameters(p): Parameters<DraftIdParams>) -> ToolResult {
         tool_op(|conn| {
-            let pair_id = el::finalize_draft(conn, p.draft_id)?;
-            Ok(ok_json(serde_json::json!({ "pair_id": pair_id, "finalized": true })))
+            let result = el::finalize_draft_with_analysis(conn, p.draft_id)?;
+            Ok(ok_json(serde_json::json!({
+                "pair_id": result.pair_id,
+                "finalized": true,
+                "analysis": result.analysis,
+                "promoted_patterns": result.promoted_patterns.iter().map(|(id, rule, count, pairs)| {
+                    serde_json::json!({ "pattern_id": id, "rule": rule, "occurrences": count, "pairs": pairs })
+                }).collect::<Vec<_>>(),
+                "next_step": "Review the analysis. Derive voice lessons from the deletions and word swaps, then store them with add_lesson and create matchable patterns with add_pattern.",
+            })))
         })
     }
 
@@ -437,29 +459,9 @@ impl EmailServer {
         })
     }
 
-    // --- lint (the write loop: stored patterns → draft violations) ---
-
-    /// Scan draft content against all stored voice patterns. This is the
-    /// single highest-leverage tool — it makes stored lessons actually do
-    /// something. Call before showing a draft to the user.
-    #[tool(description = "Lint draft content against stored voice patterns. Pass draft_id to lint a draft's latest revision, or pass raw content directly. Returns violations for 'avoid' patterns that matched and suggestions for 'prefer' patterns that were absent.")]
-    fn lint(&self, Parameters(p): Parameters<LintParams>) -> ToolResult {
-        tool_op(|conn| {
-            let content = if let Some(id) = p.draft_id {
-                match el::get_draft(conn, id)? {
-                    Some(d) => d.revisions.last().map(|r| r.content.clone())
-                        .unwrap_or_default(),
-                    None => return Ok(err_text(format!("no draft with id {id}"))),
-                }
-            } else if let Some(c) = p.content {
-                c
-            } else {
-                return Ok(err_text("pass either draft_id or content".to_string()));
-            };
-            let violations = el::lint_draft(conn, &content)?;
-            Ok(ok_json(serde_json::json!({ "violation_count": violations.len(), "violations": violations })))
-        })
-    }
+    // --- patterns + analysis + feedback ---
+    // Linting is automatic: create_draft and save_revision return violations.
+    // No standalone lint tool — fewer round-trips for the agent.
 
     /// Add a matchable voice pattern the lint engine will check drafts against.
     #[tool(description = "Add a matchable voice pattern for the lint engine. pattern_type is 'literal' or 'regex'. direction is 'avoid' (flag if found) or 'prefer' (flag if absent). Returns the new pattern id.")]
@@ -539,19 +541,20 @@ impl ServerHandler for EmailServer {
         .with_server_info(Implementation::from_build_env())
         .with_protocol_version(ProtocolVersion::V_2024_11_05)
         .with_instructions(
-            "email-learn: a local library that teaches agents to write in the user's voice \
-             by learning from (draft → final) email revision pairs.\n\
-             \nThe loop: create_draft (agent writes) → lint against stored patterns → \
-             the user edits in the app → finalize_draft stores the (original → final) diff \
-             as a pair → analyze_diff surfaces deletions/additions/word-swaps for lesson \
-             derivation → the agent stores a voice lesson with add_lesson and a matchable \
-             pattern with add_pattern. Before drafting, call list_lessons / list_patterns / \
-             lint to load and apply what's already been learned.\n\
-             \nLint is the write loop: stored patterns actually do something. Call lint \
-             before showing a draft to the user. Give feedback with give_feedback \
-             if anything is painful.\n\
-             \nLesson derivation stays in YOUR session — this server only stores and \
-             retrieves. One DB is shared by this server, the CLI, and the Tauri app."
+            "email-learn: a local voice-learning system for email agents.\n\
+             \nWORKFLOW (one pass through the loop):\n\
+             1. create_draft — writes the draft AND returns all voice patterns + lint\n\
+                violations. Fix violations with save_revision before the user sees it.\n\
+             2. The user edits the draft in the Tauri app (outside this session).\n\
+             3. finalize_draft — stores the (original → edited) pair AND returns diff\n\
+                analysis (deletions, word swaps, pattern hits) + auto-promoted patterns.\n\
+                Derive voice lessons from the analysis and store them with add_lesson\n\
+                + add_pattern. Patterns auto-promote to 'confirmed' after 3+ occurrences.\n\
+             \nLinting is automatic — create_draft and save_revision both return violations.\n\
+             No separate lint call needed. Patterns are the write loop: they catch voice\n\
+             issues before the user sees the draft.\n\
+             \nGive feedback with give_feedback if anything is painful. One DB is shared\n\
+             by this server, the CLI, and the Tauri app."
                 .to_string(),
         )
     }
