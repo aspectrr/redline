@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, parseDiff } from "./lib/api";
-import type { Draft, DraftWithRevisions, DiffRow, Lesson, Pair, SearchResult, Pattern, Violation, Feedback } from "./lib/api";
+import type { Draft, DraftWithRevisions, DiffRow, Lesson, Pair, SearchResult, Pattern, Violation, Feedback, DiffAnalysis } from "./lib/api";
 import "./App.css";
 
 type View = "drafts" | "library" | "search" | "lessons" | "patterns" | "feedback";
@@ -414,7 +414,7 @@ export default function App() {
 }
 
 function DiffPane({ diff, oldText, newText }: { diff: string; oldText?: string; newText?: string }) {
-  const [mode, setMode] = useState<"lines" | "sentences">("lines");
+  const [mode, setMode] = useState<"lines" | "sentences" | "split">("lines");
   const [sentenceDiff, setSentenceDiff] = useState<string>("");
 
   useEffect(() => {
@@ -425,23 +425,50 @@ function DiffPane({ diff, oldText, newText }: { diff: string; oldText?: string; 
 
   const activeDiff = mode === "sentences" ? sentenceDiff : diff;
   const rows = parseDiff(activeDiff);
-  if (!rows.some(r => r.kind !== "equal")) {
+  const hasChanges = rows.some(r => r.kind !== "equal");
+
+  const modes = (
+    <div className="diff-mode">
+      <button className={mode === "lines" ? "active" : ""} onClick={() => setMode("lines")}>lines</button>
+      <button className={mode === "sentences" ? "active" : ""} onClick={() => setMode("sentences")}>sentences</button>
+      <button className={mode === "split" ? "active" : ""} onClick={() => setMode("split")}>side-by-side</button>
+    </div>
+  );
+
+  if (!hasChanges) {
     return (
       <div className="diff-pane">
-        <div className="diff-mode">
-          <button className={mode === "lines" ? "active" : ""} onClick={() => setMode("lines")}>lines</button>
-          <button className={mode === "sentences" ? "active" : ""} onClick={() => setMode("sentences")}>sentences</button>
-        </div>
+        {modes}
         <div className="empty small">No changes yet — the editor matches the original draft.</div>
       </div>
     );
   }
+
+  if (mode === "split") {
+    return (
+      <div className="diff-pane">
+        {modes}
+        <div className="diff-split">
+          <div className="diff-split-col">
+            <div className="diff-split-head del">Removed</div>
+            <pre className="diff">
+              {rows.map((row, i) => row.kind === "removed" ? <DiffLine key={i} row={row} /> : null)}
+            </pre>
+          </div>
+          <div className="diff-split-col">
+            <div className="diff-split-head add">Added</div>
+            <pre className="diff">
+              {rows.map((row, i) => row.kind === "added" ? <DiffLine key={i} row={row} /> : null)}
+            </pre>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="diff-pane">
-      <div className="diff-mode">
-        <button className={mode === "lines" ? "active" : ""} onClick={() => setMode("lines")}>lines</button>
-        <button className={mode === "sentences" ? "active" : ""} onClick={() => setMode("sentences")}>sentences</button>
-      </div>
+      {modes}
       <pre className="diff">
         {rows.map((row, i) => <DiffLine key={i} row={row} />)}
       </pre>
@@ -568,6 +595,7 @@ function PairDetail({ pair, onDelete }: { pair: Pair; onDelete: (id: number) => 
         <div><h4>Draft</h4><pre>{pair.draft}</pre></div>
         <div><h4>Final</h4><pre>{pair.final}</pre></div>
       </div>
+      <DeletionsSection pairId={pair.id} />
       <h4>Diff</h4>
       <DiffPane diff={pair.diff} oldText={pair.draft} newText={pair.final} />
     </div>
@@ -586,6 +614,50 @@ function shortWhen(iso: string): string {
 function truncate(s: string, n: number): string {
   s = s.replace(/\s+/g, " ").trim();
   return s.length > n ? s.slice(0, n) + "…" : s;
+}
+
+// Surfaces deletions and categorized changes above the raw diff so the user
+// sees the voice signal first, not the line-level noise.
+function DeletionsSection({ pairId }: { pairId: number }) {
+  const [analysis, setAnalysis] = useState<DiffAnalysis | null>(null);
+
+  useEffect(() => {
+    api.analyzePair(pairId).then(setAnalysis).catch(() => setAnalysis(null));
+  }, [pairId]);
+
+  if (!analysis) return null;
+  const deletions = analysis.deletions;
+  const categorized = analysis.categorized || [];
+  const noSignal = deletions.length === 0 && categorized.length === 0;
+  if (noSignal) return null;
+
+  return (
+    <div className="analysis-section">
+      {deletions.length > 0 && (
+        <>
+          <h4 className="signal-head">✂ Deletions ({deletions.length})</h4>
+          <ul className="signal-list">
+            {deletions.map((d, i) => (
+              <li key={i} className="signal-item del">{d}</li>
+            ))}
+          </ul>
+        </>
+      )}
+      {categorized.length > 0 && (
+        <>
+          <h4 className="signal-head">Categorized changes</h4>
+          <ul className="cat-list">
+            {categorized.map((c, i) => (
+              <li key={i} className={"cat-item " + c.category}>
+                <span className={"cat-badge " + c.category}>{c.category}</span>
+                <span className="cat-desc">{c.description}</span>
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+    </div>
+  );
 }
 
 // --- lint panel (drafts right-pane) ---

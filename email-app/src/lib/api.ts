@@ -106,6 +106,23 @@ export interface Feedback {
   created_at: string;
 }
 
+export interface CategorizedChange {
+  category: string;
+  description: string;
+  before: string;
+  after: string;
+}
+
+export interface DiffAnalysis {
+  pair_id: number;
+  deletions: string[];
+  additions: string[];
+  word_swaps: [string, string][];
+  categorized: CategorizedChange[];
+  draft_pattern_hits: { pattern_id: number; rule: string }[];
+  final_pattern_hits: { pattern_id: number; rule: string }[];
+}
+
 export const api = {
   listDrafts: (includeFinalized = false) =>
     invoke<Draft[]>("list_drafts", { includeFinalized }),
@@ -140,4 +157,5 @@ export const api = {
   listFeedback: () => invoke<Feedback[]>("list_feedback"),
   computeDiff: (old: string, newText: string, mode?: string) =>
     invoke<string>("compute_diff", { old, new: newText, mode }),
+  analyzePair: (pairId: number) => invoke<DiffAnalysis | null>("analyze_pair", { pairId }),
 };

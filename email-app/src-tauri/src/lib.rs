@@ -176,6 +176,15 @@ fn compute_diff(old: String, new: String, mode: Option<String>) -> CmdResult<Str
     s(serde_json::to_string(&rows))
 }
 
+#[tauri::command]
+fn analyze_pair(pair_id: i64) -> CmdResult<Option<serde_json::Value>> {
+    let c = conn()?;
+    let analysis = el::analyze_diff(&c, pair_id)
+        .map_err(|e| format!("{e:?}"))?;
+    let result = analysis.map(|x| serde_json::to_value(x).unwrap_or(serde_json::json!(null)));
+    Ok(result)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -203,6 +212,7 @@ pub fn run() {
             delete_pattern,
             list_feedback,
             compute_diff,
+            analyze_pair,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

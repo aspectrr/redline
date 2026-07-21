@@ -910,9 +910,19 @@ pub fn lint_draft(conn: &Connection, content: &str) -> anyhow::Result<Vec<Violat
 
 // ---------- diff analysis (surface patterns for lesson derivation) ----------
 
+/// A single categorized change from a pair's diff. Each hunk gets tagged
+/// so agents can prioritize voice learning without manual archaeology.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct CategorizedChange {
+    pub category: String,  // "structural" | "stylistic" | "factual" | "deletion" | "punctuation"
+    pub description: String,
+    pub before: String,
+    pub after: String,
+}
+
 /// Extracted signal from a pair's diff, structured so an agent can derive
 /// candidate voice patterns without manual archaeology.
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct DiffAnalysis {
     pub pair_id: i64,
     /// All deleted segments — the strongest voice signal (what got cut).
@@ -921,16 +931,110 @@ pub struct DiffAnalysis {
     pub additions: Vec<String>,
     /// Word-level swaps: (old_word, new_word) for inline replacements.
     pub word_swaps: Vec<(String, String)>,
+    /// Each change categorized: structural, stylistic, factual, deletion, punctuation.
+    pub categorized: Vec<CategorizedChange>,
     /// Existing lint patterns that fire on this pair's draft (what was avoided
     /// before and got through — or was deliberately kept).
     pub draft_pattern_hits: Vec<PatternHit>,
     pub final_pattern_hits: Vec<PatternHit>,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct PatternHit {
     pub pattern_id: i64,
     pub rule: String,
+}
+
+/// Classify a single diff hunk. The heuristics are deliberately simple —
+/// they prioritize the categories the reviewer identified as highest signal:
+/// deletions (strongest voice signal), then factual (numbers/names/dates),
+/// then punctuation (em-dashes, commas), then structural (whole lines added/
+/// removed), and stylistic as the catch-all.
+fn categorize_change(before: &str, after: &str) -> CategorizedChange {
+    let b = before.trim();
+    let a = after.trim();
+
+    // pure deletion — line removed with no replacement
+    if !b.is_empty() && a.is_empty() {
+        return CategorizedChange {
+            category: "deletion".into(),
+            description: format!("Deleted: \"{}\"", truncate_str(b, 80)),
+            before: b.into(),
+            after: a.into(),
+        };
+    }
+    // pure addition — new line with no removed counterpart
+    if b.is_empty() && !a.is_empty() {
+        // adding a whole new line is structural
+        return CategorizedChange {
+            category: "structural".into(),
+            description: format!("Added: \"{}\"", truncate_str(a, 80)),
+            before: b.into(),
+            after: a.into(),
+        };
+    }
+
+    // Check for factual changes: numbers, names, dates
+    let num_re = regex::Regex::new(r"\$?[0-9][0-9,]*(\.[0-9]+)?%?").unwrap();
+    let date_re = regex::Regex::new(r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2}\b").unwrap();
+    let b_nums: Vec<&str> = num_re.find_iter(b).map(|m| m.as_str()).collect();
+    let a_nums: Vec<&str> = num_re.find_iter(a).map(|m| m.as_str()).collect();
+    let b_dates = date_re.is_match(b);
+    let a_dates = date_re.is_match(a);
+    if b_nums != a_nums || (b_dates && !a_dates) || (!b_dates && a_dates) {
+        return CategorizedChange {
+            category: "factual".into(),
+            description: format!("Factual change: \"{}\" \u{2192} \"{}\"", truncate_str(b, 50), truncate_str(a, 50)),
+            before: b.into(),
+            after: a.into(),
+        };
+    }
+
+    // Check for punctuation-only changes (em-dashes, commas, periods)
+    let letters_unchanged = b.chars()
+        .filter(|c| c.is_alphanumeric())
+        .collect::<String>()
+        .to_lowercase()
+        == a.chars()
+            .filter(|c| c.is_alphanumeric())
+            .collect::<String>()
+            .to_lowercase();
+    let punct_changed = b != a;
+    if letters_unchanged && punct_changed {
+        return CategorizedChange {
+            category: "punctuation".into(),
+            description: format!("Punctuation: \"{}\" \u{2192} \"{}\"", truncate_str(b, 50), truncate_str(a, 50)),
+            before: b.into(),
+            after: a.into(),
+        };
+    }
+
+    // Check for structural: very different lengths or many words changed
+    let b_words = b.split_whitespace().count();
+    let a_words = a.split_whitespace().count();
+    let len_diff = (b_words as i64 - a_words as i64).unsigned_abs();
+    if len_diff >= 4 || (b_words > 3 && a_words > 3 && b_words as f64 / a_words.max(1) as f64 > 1.5)
+        || (a_words > 3 && b_words > 3 && a_words as f64 / b_words.max(1) as f64 > 1.5)
+    {
+        return CategorizedChange {
+            category: "structural".into(),
+            description: format!("Structural rewrite: \"{}\" \u{2192} \"{}\"", truncate_str(b, 50), truncate_str(a, 50)),
+            before: b.into(),
+            after: a.into(),
+        };
+    }
+
+    // Default: stylistic (rewording, tone shifts)
+    CategorizedChange {
+        category: "stylistic".into(),
+        description: format!("Stylistic: \"{}\" \u{2192} \"{}\"", truncate_str(b, 50), truncate_str(a, 50)),
+        before: b.into(),
+        after: a.into(),
+    }
+}
+
+fn truncate_str(s: &str, n: usize) -> &str {
+    if s.len() <= n { s } else { &s[..n] }
 }
 
 /// Analyze a finalized pair's diff. Surfaces deletions, additions, word swaps,
@@ -946,6 +1050,7 @@ pub fn analyze_diff(conn: &Connection, pair_id: i64) -> anyhow::Result<Option<Di
     let mut deletions = Vec::new();
     let mut additions = Vec::new();
     let mut word_swaps = Vec::new();
+    let mut categorized = Vec::new();
 
     let mut i = 0;
     while i < rows.len() {
@@ -960,7 +1065,7 @@ pub fn analyze_diff(conn: &Connection, pair_id: i64) -> anyhow::Result<Option<Di
                 .filter(|s| !s.is_empty())
                 .collect();
 
-            // pair with next added row for word-level swaps
+            // pair with next added row for word-level swaps + categorization
             if i + 1 < rows.len() && rows[i + 1].kind == "added" {
                 let add_words: Vec<&str> = rows[i + 1].segments.iter()
                     .filter(|s| s.tag == "add")
@@ -975,9 +1080,11 @@ pub fn analyze_diff(conn: &Connection, pair_id: i64) -> anyhow::Result<Option<Di
                     .map(|s| s.text.as_str())
                     .collect();
                 additions.push(add_text.trim().to_string());
+                categorized.push(categorize_change(&del_text, &add_text));
                 i += 2;
             } else {
                 deletions.push(del_text.trim().to_string());
+                categorized.push(categorize_change(&del_text, ""));
                 i += 1;
             }
         } else if rows[i].kind == "added" {
@@ -985,6 +1092,7 @@ pub fn analyze_diff(conn: &Connection, pair_id: i64) -> anyhow::Result<Option<Di
                 .map(|s| s.text.as_str())
                 .collect();
             additions.push(add_text.trim().to_string());
+            categorized.push(categorize_change("", &add_text));
             i += 1;
         } else {
             i += 1;
@@ -1013,6 +1121,7 @@ pub fn analyze_diff(conn: &Connection, pair_id: i64) -> anyhow::Result<Option<Di
         deletions,
         additions,
         word_swaps,
+        categorized,
         draft_pattern_hits: draft_hits,
         final_pattern_hits: final_hits,
     }))
@@ -1116,6 +1225,7 @@ fn finalize_draft_impl(conn: &Connection, draft_id: i64) -> anyhow::Result<Final
             deletions: vec![],
             additions: vec![],
             word_swaps: vec![],
+            categorized: vec![],
             draft_pattern_hits: vec![],
             final_pattern_hits: vec![],
         });
@@ -1538,5 +1648,46 @@ mod tests {
         // verify confidence is now confirmed
         let pats = list_patterns(&conn, None).unwrap();
         assert_eq!(pats[0].confidence, "confirmed");
+    }
+
+    #[test]
+    fn categorize_change_detects_each_type() {
+        // deletion: line removed with no replacement
+        let d = categorize_change("This is important.", "");
+        assert_eq!(d.category, "deletion");
+
+        // structural: added line with no removed counterpart
+        let s = categorize_change("", "Brand new paragraph here.");
+        assert_eq!(s.category, "structural");
+
+        // punctuation: em-dash to period
+        let p = categorize_change("Hey — quick note", "Hey. Quick note");
+        assert_eq!(p.category, "punctuation");
+
+        // factual: number changed
+        let f = categorize_change("Budget is $500", "Budget is $750");
+        assert_eq!(f.category, "factual");
+
+        // stylistic: word swap, same structure
+        let st = categorize_change("I wanted to reach out", "Quick note on this");
+        assert_eq!(st.category, "stylistic");
+    }
+
+    #[test]
+    fn analyze_diff_includes_categorized() {
+        let path = tmp_db();
+        let conn = connect_at(&path).unwrap();
+        // pair with deletion, punctuation change, and factual change
+        let pair_id = add_pair(
+            &conn,
+            "Hey — budget is $500.\nTagline goes here.\n",
+            "Hey. Budget is $750.\n",
+            None, &[],
+        ).unwrap();
+        let a = analyze_diff(&conn, pair_id).unwrap().expect("analysis exists");
+        assert!(!a.categorized.is_empty(), "should have categorized changes");
+        // should have at least one deletion (the tagline)
+        assert!(a.categorized.iter().any(|c| c.category == "deletion"),
+            "should detect deletion: {:?}", a.categorized);
     }
 }
