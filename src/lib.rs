@@ -115,6 +115,13 @@ pub fn db_path() -> PathBuf {
     let new_path = p.join("redline.db");
     let legacy_path = p.join("emails.db");
     if new_path.exists() {
+        // If redline.db exists but is empty (created by a prior connect_at
+        // before legacy data was migrated), and emails.db has data, copy it.
+        if let Ok(meta) = std::fs::metadata(&new_path) {
+            if meta.len() < 1024 && legacy_path.exists() {
+                let _ = std::fs::copy(&legacy_path, &new_path);
+            }
+        }
         new_path
     } else if legacy_path.exists() {
         legacy_path
