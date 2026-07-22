@@ -234,7 +234,7 @@ export default function App() {
   return (
     <div class="app">
       <header class="topbar">
-        <div class="brand">✉️ Redline</div>
+        <div class="brand"><img src="/redline-icon.svg" alt="Redline" /> Redline</div>
         <nav class="tabs">
           <button class={view() === "drafts" ? "active" : ""} onClick={() => setView("drafts")}>Drafts</button>
           <button class={view() === "library" ? "active" : ""} onClick={() => setView("library")}>Library</button>

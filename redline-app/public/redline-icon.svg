@@ -1,0 +1,84 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <!-- Background gradient: deep charcoal to near-black with a subtle warm tint -->
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1a1a2e"/>
+      <stop offset="100%" stop-color="#0f0f1a"/>
+    </linearGradient>
+
+    <!-- Red strike gradient -->
+    <linearGradient id="redGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#ff4757"/>
+      <stop offset="100%" stop-color="#ff6b6b"/>
+    </linearGradient>
+
+    <!-- Green addition gradient -->
+    <linearGradient id="greenGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#2ed573"/>
+      <stop offset="100%" stop-color="#1abc9c"/>
+    </linearGradient>
+
+    <!-- Soft glow filter -->
+    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="8" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+
+    <!-- Rounded rect clip -->
+    <clipPath id="rounded">
+      <rect width="1024" height="1024" rx="224" ry="224"/>
+    </clipPath>
+  </defs>
+
+  <!-- Background -->
+  <g clip-path="url(#rounded)">
+    <rect width="1024" height="1024" fill="url(#bg)"/>
+
+    <!-- Subtle grid texture suggesting "lines of text" -->
+    <g opacity="0.03">
+      <line x1="0" y1="200" x2="1024" y2="200" stroke="white" stroke-width="2"/>
+      <line x1="0" y1="280" x2="1024" y2="280" stroke="white" stroke-width="2"/>
+      <line x1="0" y1="360" x2="1024" y2="360" stroke="white" stroke-width="2"/>
+      <line x1="0" y1="440" x2="1024" y2="440" stroke="white" stroke-width="2"/>
+      <line x1="0" y1="520" x2="1024" y2="520" stroke="white" stroke-width="2"/>
+      <line x1="0" y1="600" x2="1024" y2="600" stroke="white" stroke-width="2"/>
+      <line x1="0" y1="680" x2="1024" y2="680" stroke="white" stroke-width="2"/>
+      <line x1="0" y1="760" x2="1024" y2="760" stroke="white" stroke-width="2"/>
+      <line x1="0" y1="840" x2="1024" y2="840" stroke="white" stroke-width="2"/>
+    </g>
+  </g>
+
+  <!-- Doc lines representing text being edited -->
+
+  <!-- Line 1: struck through (red) — "deleted" text -->
+  <g filter="url(#glow)">
+    <rect x="232" y="250" width="420" height="44" rx="22" fill="url(#redGrad)" opacity="0.9"/>
+    <line x1="210" y1="272" x2="674" y2="272" stroke="#ff4757" stroke-width="5" stroke-linecap="round" opacity="0.7"/>
+  </g>
+
+  <!-- Line 2: replacement (green) — "added" text, slightly shorter, indented -->
+  <g filter="url(#glow)">
+    <rect x="290" y="350" width="340" height="44" rx="22" fill="url(#greenGrad)" opacity="0.9"/>
+  </g>
+
+  <!-- Line 3: unchanged context (muted) -->
+  <rect x="232" y="450" width="460" height="44" rx="22" fill="#2a2a4a" opacity="0.8"/>
+
+  <!-- Line 4: another edit — struck through -->
+  <g filter="url(#glow)">
+    <rect x="232" y="550" width="300" height="44" rx="22" fill="url(#redGrad)" opacity="0.7"/>
+    <line x1="210" y1="572" x2="554" y2="572" stroke="#ff4757" stroke-width="5" stroke-linecap="round" opacity="0.5"/>
+  </g>
+
+  <!-- Line 5: green replacement -->
+  <g filter="url(#glow)">
+    <rect x="290" y="650" width="380" height="44" rx="22" fill="url(#greenGrad)" opacity="0.8"/>
+  </g>
+
+  <!-- The "R" monogram — subtle, bottom right -->
+  <text x="780" y="830" font-family="SF Pro Display, Helvetica Neue, Arial, sans-serif"
+        font-size="180" font-weight="800" fill="#e8e8f0" opacity="0.12" text-anchor="middle">R</text>
+</svg>
