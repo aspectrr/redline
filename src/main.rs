@@ -139,6 +139,13 @@ enum Cmd {
     /// Manually trigger pattern promotion. Scans all pairs, auto-promotes
     /// patterns with 3+ draft occurrences to 'confirmed'.
     Promote,
+    /// Process pending derivation jobs. Requires REDLINE_MODEL_PROVIDER,
+    /// REDLINE_MODEL_NAME, and optionally REDLINE_API_KEY env vars.
+    /// Processes all pending jobs once, or polls every 30s with --watch.
+    Derive {
+        #[arg(long)]
+        watch: bool,
+    },
 }
 
 fn read_text(path: &PathBuf) -> anyhow::Result<String> {
@@ -223,11 +230,12 @@ fn run() -> anyhow::Result<()> {
 
         Cmd::Draft { path, context, tags, source } => {
             let body = read_text(&path)?;
-            let ctx = el::create_draft_with_context(&conn, &body, context.as_deref(), &tags, &source)?;
+            let ctx = el::create_draft_with_context(&conn, &body, context.as_deref(), &tags, &source, None)?;
             println!("{}", serde_json::to_string_pretty(&serde_json::json!({
                 "draft_id": ctx.draft_id,
                 "patterns": ctx.patterns,
                 "violations": ctx.violations,
+                "pending_lessons": ctx.pending_lessons,
             }))?);
         }
         Cmd::Finalize { draft_id } => {
@@ -316,6 +324,23 @@ fn run() -> anyhow::Result<()> {
                 .enable_all()
                 .build()?
                 .block_on(el::mcp::serve())?;
+        }
+        Cmd::Derive { watch } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(async {
+                loop {
+                    let (processed, succeeded, failed) = el::deriver::process_pending().await;
+                    if processed > 0 {
+                        println!("derived: {succeeded}/{processed} succeeded, {failed} failed");
+                    } else if !watch {
+                        println!("no pending derivation jobs");
+                    }
+                    if !watch {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                }
+            });
         }
     }
     Ok(())

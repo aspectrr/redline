@@ -5,6 +5,8 @@
 // against the diffs we surface.
 
 pub mod mcp;
+pub mod deriver;
+pub mod pi_context;
 
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
@@ -36,6 +38,7 @@ CREATE TABLE IF NOT EXISTS drafts (
     tags              TEXT,
     status            TEXT NOT NULL DEFAULT 'draft',
     finalized_pair_id INTEGER REFERENCES pairs(id) ON DELETE SET NULL,
+    transcript        TEXT,
     created_at        TEXT NOT NULL,
     updated_at        TEXT NOT NULL
 );
@@ -73,10 +76,34 @@ CREATE INDEX IF NOT EXISTS idx_patterns_lesson ON patterns(lesson_id);
 CREATE INDEX IF NOT EXISTS idx_lessons_tags ON lessons(tags);
 CREATE INDEX IF NOT EXISTS idx_drafts_status ON drafts(status);
 CREATE INDEX IF NOT EXISTS idx_draft_revisions_draft ON draft_revisions(draft_id);
+CREATE TABLE IF NOT EXISTS derivation_jobs (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    pair_id      INTEGER NOT NULL UNIQUE REFERENCES pairs(id) ON DELETE CASCADE,
+    status       TEXT NOT NULL DEFAULT 'pending',
+    attempts     INTEGER NOT NULL DEFAULT 0,
+    error        TEXT,
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_derivation_jobs_status ON derivation_jobs(status);
+CREATE TABLE IF NOT EXISTS settings (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS models_cache (
+    model_id    TEXT PRIMARY KEY,
+    provider    TEXT NOT NULL,
+    name        TEXT,
+    tool_call   INTEGER NOT NULL DEFAULT 0,
+    api_key_env TEXT,
+    cached_at   TEXT NOT NULL
+);
 ";
 
-/// Where the shared, cross-project voice DB lives.
-/// Override with `REDLINE_DB=/abs/path/emails.db`.
+/// Where the shared, cross-project writing DB lives.
+/// Override with `REDLINE_DB=/abs/path/redline.db`.
+/// Falls back to legacy `emails.db` if it exists (backward compat).
 pub fn db_path() -> PathBuf {
     if let Ok(p) = std::env::var("REDLINE_DB") {
         return PathBuf::from(p);
@@ -85,8 +112,15 @@ pub fn db_path() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     p.push(".redline");
-    p.push("emails.db");
-    p
+    let new_path = p.join("redline.db");
+    let legacy_path = p.join("emails.db");
+    if new_path.exists() {
+        new_path
+    } else if legacy_path.exists() {
+        legacy_path
+    } else {
+        new_path
+    }
 }
 
 pub fn connect() -> anyhow::Result<Connection> {
@@ -101,6 +135,9 @@ pub fn connect_at(path: &std::path::Path) -> anyhow::Result<Connection> {
     }
     let conn = Connection::open(path)?;
     conn.execute_batch(SCHEMA)?;
+    // Migration: add transcript column to existing DBs (idempotent — fails
+    // silently if the column already exists).
+    let _ = conn.execute_batch("ALTER TABLE drafts ADD COLUMN transcript TEXT");
     // WAL so the Tauri UI and the CLI can both touch the DB without clobbering.
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -109,6 +146,128 @@ pub fn connect_at(path: &std::path::Path) -> anyhow::Result<Connection> {
 
 pub fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339()
+}
+
+// ---------- model config (for async derivation) ----------
+//
+// The derivation agent needs to know which model to call and how to
+// authenticate. Read from env so the daemon can run independently of the
+// drafting agent's session.
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ModelConfig {
+    pub provider: String,
+    pub model: String,
+    pub api_key: Option<String>,
+    pub base_url: String,
+}
+
+/// Read model config from the environment. Returns None if the provider or
+/// model name is unset — callers should check and skip derivation.
+pub fn model_config_from_env() -> Option<ModelConfig> {
+    let provider = std::env::var("REDLINE_MODEL_PROVIDER").ok()?;
+    let model = std::env::var("REDLINE_MODEL_NAME").ok()?;
+    let api_key = std::env::var("REDLINE_API_KEY").ok();
+    let base_url = std::env::var("REDLINE_MODEL_URL").ok().unwrap_or_else(|| {
+        // sensible defaults per provider
+        match provider.as_str() {
+            "anthropic" => "https://api.anthropic.com/v1".into(),
+            "ollama" => "http://localhost:11434/v1".into(),
+            _ => "https://api.openai.com/v1".into(),
+        }
+    });
+    Some(ModelConfig { provider, model, api_key, base_url })
+}
+
+/// Auto-detect model config for derivation. Priority:
+/// 1. Pi session config (if running inside pi)
+/// 2. Env vars (REDLINE_MODEL_*)
+/// 3. Settings DB (user-configured provider key)
+pub fn auto_detect_model_config(conn: &Connection) -> Option<ModelConfig> {
+    // Try pi context first
+    if let Some(cfg) = pi_context::detect_model_config() {
+        // Check if user has overridden the API key in settings
+        let key = get_setting(conn, &format!("provider:{}:api_key", cfg.provider));
+        let api_key = key.or(cfg.api_key);
+        return Some(ModelConfig { api_key, ..cfg });
+    }
+    // Fall back to env vars
+    if let Some(cfg) = model_config_from_env() {
+        return Some(cfg);
+    }
+    // Fall back to settings DB
+    let provider = get_setting(conn, "deriver:provider")?;
+    let model = get_setting(conn, "deriver:model")?;
+    let api_key = get_setting(conn, &format!("provider:{}:api_key", provider));
+    let base_url = get_setting(conn, &format!("provider:{}:base_url", provider))
+        .unwrap_or_else(|| "https://api.openai.com/v1".into());
+    Some(ModelConfig { provider, model, api_key, base_url })
+}
+
+// ---------- settings ----------
+
+pub fn get_setting(conn: &Connection, key: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT value FROM settings WHERE key = ?1",
+        params![key],
+        |r| r.get(0),
+    ).ok()
+}
+
+pub fn set_setting(conn: &Connection, key: &str, value: &str) -> anyhow::Result<()> {
+    let now = now_iso();
+    conn.execute(
+        "INSERT INTO settings (key, value, updated_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(key) DO UPDATE SET value = ?2, updated_at = ?3",
+        params![key, value, now],
+    )?;
+    Ok(())
+}
+
+pub fn get_all_settings(conn: &Connection) -> anyhow::Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare("SELECT key, value FROM settings ORDER BY key")?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+// ---------- models cache ----------
+
+pub fn cache_model(
+    conn: &Connection,
+    model_id: &str,
+    provider: &str,
+    name: Option<&str>,
+    tool_call: bool,
+    api_key_env: Option<&str>,
+) -> anyhow::Result<()> {
+    let now = now_iso();
+    conn.execute(
+        "INSERT INTO models_cache (model_id, provider, name, tool_call, api_key_env, cached_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(model_id) DO UPDATE SET
+            provider = ?2, name = ?3, tool_call = ?4, api_key_env = ?5, cached_at = ?6",
+        params![model_id, provider, name, tool_call as i64, api_key_env, now],
+    )?;
+    Ok(())
+}
+
+pub fn list_cached_models(conn: &Connection, provider: Option<&str>) -> anyhow::Result<Vec<(String, String, Option<String>, bool, Option<String>)>> {
+    let mut stmt = conn.prepare(
+        "SELECT model_id, provider, name, tool_call, api_key_env FROM models_cache
+         WHERE (?1 IS NULL OR provider = ?1) ORDER BY provider, model_id"
+    )?;
+    let rows = stmt.query_map(params![provider], |r| {
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, i64>(3)? != 0, r.get(4)?))
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
 }
 
 // ---------- diff (GitHub-style: line-level with intra-line word highlights) ----------
@@ -399,6 +558,52 @@ pub fn tags_to_json(tags: &[String]) -> String {
     serde_json::to_string(tags).unwrap_or_else(|_| "[]".into())
 }
 
+// ---------- pending lessons + transcript retrieval ----------
+//
+// Finalized pairs with no derived lessons yet. Surfaced on create_draft so
+// the agent processes them before writing — clearing learning debt improves
+// the current draft's patterns.
+
+pub fn pending_lessons(conn: &Connection) -> anyhow::Result<Vec<PendingPair>> {
+    let mut stmt = conn.prepare(
+        "SELECT p.id, d.id, p.context, p.tags, p.created_at,
+                d.transcript IS NOT NULL
+         FROM pairs p
+         LEFT JOIN lessons l ON l.pair_id = p.id
+         LEFT JOIN drafts d ON d.finalized_pair_id = p.id
+         WHERE l.id IS NULL
+         ORDER BY p.id DESC",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(PendingPair {
+            pair_id: r.get(0)?,
+            draft_id: r.get(1)?,
+            context: r.get(2)?,
+            tags: parse_tags(r.get::<_, Option<String>>(3)?.as_deref()),
+            created_at: r.get(4)?,
+            has_transcript: r.get(5)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Read the transcript captured at draft time for a given pair. Used by the
+/// derivation daemon to seed the agent with full context.
+pub fn get_pair_transcript(conn: &Connection, pair_id: i64) -> anyhow::Result<Option<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT d.transcript FROM drafts d WHERE d.finalized_pair_id = ?1",
+    )?;
+    let mut rows = stmt.query(params![pair_id])?;
+    match rows.next()? {
+        Some(r) => Ok(r.get(0)?),
+        None => Ok(None),
+    }
+}
+
 // ---------- pairs + lessons ----------
 
 pub fn add_pair(
@@ -581,12 +786,19 @@ pub fn create_draft(
     context: Option<&str>,
     tags: &[String],
     source: &str,
+    transcript: Option<&str>,
 ) -> anyhow::Result<i64> {
+    // Auto-capture transcript from pi session if not explicitly provided.
+    // This is programmatic — the agent doesn't need to pass it.
+    let transcript = transcript
+        .map(String::from)
+        .or_else(pi_context::auto_capture_transcript);
+
     let now = now_iso();
     let tags_json = tags_to_json(tags);
     conn.execute(
-        "INSERT INTO drafts (context, tags, status, created_at, updated_at) VALUES (?1,?2,'draft',?3,?3)",
-        params![context, tags_json, now],
+        "INSERT INTO drafts (context, tags, status, transcript, created_at, updated_at) VALUES (?1,?2,'draft',?3,?4,?4)",
+        params![context, tags_json, transcript, now],
     )?;
     let draft_id = conn.last_insert_rowid();
     conn.execute(
@@ -596,9 +808,23 @@ pub fn create_draft(
     Ok(draft_id)
 }
 
-/// Rich result from create_draft with patterns to respect + lint violations.
-/// This is the write-loop injection point: the agent gets back everything it
-/// needs to adjust the draft before the user sees it.
+/// A finalized pair that has no derived lessons yet. Surfaced on every
+/// create_draft so the agent can process them before writing a new draft.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct PendingPair {
+    pub pair_id: i64,
+    pub draft_id: Option<i64>,
+    pub context: Option<String>,
+    pub tags: Vec<String>,
+    pub created_at: String,
+    /// Whether the drafting agent's transcript was captured.
+    pub has_transcript: bool,
+}
+
+/// Rich result from create_draft with patterns to respect + lint violations
+/// + any pending unlearned pairs. This is the write-loop injection point:
+/// the agent gets back everything it needs to adjust the draft before the
+/// user sees it, plus learning debt to clear.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct DraftContext {
     pub draft_id: i64,
@@ -606,6 +832,8 @@ pub struct DraftContext {
     pub patterns: Vec<Pattern>,
     /// Lint violations found in the just-created content.
     pub violations: Vec<Violation>,
+    /// Finalized pairs with no derived lessons yet.
+    pub pending_lessons: Vec<PendingPair>,
 }
 
 /// Create a draft AND return the patterns + lint violations so the agent can
@@ -616,11 +844,13 @@ pub fn create_draft_with_context(
     context: Option<&str>,
     tags: &[String],
     source: &str,
+    transcript: Option<&str>,
 ) -> anyhow::Result<DraftContext> {
-    let draft_id = create_draft(conn, content, context, tags, source)?;
+    let draft_id = create_draft(conn, content, context, tags, source, transcript)?;
     let patterns = list_patterns(conn, None)?;
     let violations = lint_draft(conn, content)?;
-    Ok(DraftContext { draft_id, patterns, violations })
+    let pending_lessons = pending_lessons(conn)?;
+    Ok(DraftContext { draft_id, patterns, violations, pending_lessons })
 }
 
 pub fn list_drafts(conn: &Connection, include_finalized: bool) -> anyhow::Result<Vec<Draft>> {
@@ -1239,6 +1469,9 @@ fn finalize_draft_impl(conn: &Connection, draft_id: i64) -> anyhow::Result<Final
     // Auto-promote patterns based on the new pair data
     let promoted = promote_patterns(conn)?;
 
+    // Enqueue async derivation job (daemon picks this up if model config is set)
+    let _ = deriver::enqueue(conn, pair_id);
+
     // Return the analysis so the agent can derive lessons immediately
     let analysis = analyze_diff(conn, pair_id)?
         .unwrap_or(DiffAnalysis {
@@ -1426,6 +1659,7 @@ mod tests {
             Some("cold intro to investor"),
             &["pitch".into(), "external".into()],
             "agent",
+            None,
         )
         .unwrap();
 
@@ -1476,7 +1710,7 @@ mod tests {
     fn search_finds_draft_by_revision_body() {
         let path = tmp_db();
         let conn = connect_at(&path).unwrap();
-        create_draft(&conn, "Schedule the quarterly review\n", None, &[], "agent").unwrap();
+        create_draft(&conn, "Schedule the quarterly review\n", None, &[], "agent", None).unwrap();
         let res = search_all(&conn, "quarterly").unwrap();
         assert_eq!(res.drafts.len(), 1);
         assert_eq!(res.lessons.len(), 0);
@@ -1505,7 +1739,7 @@ mod tests {
     fn delete_draft_removes_draft_and_revisions_keeps_pair() {
         let path = tmp_db();
         let conn = connect_at(&path).unwrap();
-        let id = create_draft(&conn, "original\n", None, &[], "agent").unwrap();
+        let id = create_draft(&conn, "original\n", None, &[], "agent", None).unwrap();
         save_revision(&conn, id, "edited\n", "user").unwrap();
         let pair_id = finalize_draft(&conn, id).unwrap();
         assert!(show_pair(&conn, pair_id).unwrap().is_some());
@@ -1625,7 +1859,7 @@ mod tests {
         add_pattern(&conn, None, "No em-dashes", "—", "literal", "avoid", "punctuation", None, None).unwrap();
 
         let ctx = create_draft_with_context(
-            &conn, "Hey — quick note.", Some("test"), &[], "agent",
+            &conn, "Hey — quick note.", Some("test"), &[], "agent", None,
         ).unwrap();
 
         assert!(ctx.draft_id > 0);
@@ -1638,7 +1872,7 @@ mod tests {
     fn finalize_with_analysis_returns_diff_data() {
         let path = tmp_db();
         let conn = connect_at(&path).unwrap();
-        let id = create_draft(&conn, "I wanted to reach out.\n", None, &[], "agent").unwrap();
+        let id = create_draft(&conn, "I wanted to reach out.\n", None, &[], "agent", None).unwrap();
         save_revision(&conn, id, "Quick note.\n", "user").unwrap();
 
         let result = finalize_draft_with_analysis(&conn, id).unwrap();
@@ -1710,5 +1944,48 @@ mod tests {
         // should have at least one deletion (the tagline)
         assert!(a.categorized.iter().any(|c| c.category == "deletion"),
             "should detect deletion: {:?}", a.categorized);
+    }
+
+    #[test]
+    fn transcript_captured_and_pending_lessons_surface() {
+        let path = tmp_db();
+        let conn = connect_at(&path).unwrap();
+
+        // create a draft WITH transcript
+        let id = create_draft(
+            &conn, "I wanted to reach out.\n", Some("cold intro"), &[], "agent",
+            Some("User asked for a cold intro email to a VC. Constraints: under 150 words."),
+        ).unwrap();
+        save_revision(&conn, id, "Quick note.\n", "user").unwrap();
+        let pair_id = finalize_draft(&conn, id).unwrap();
+
+        // transcript is retrievable via the linked draft
+        let transcript = get_pair_transcript(&conn, pair_id).unwrap();
+        assert!(transcript.is_some(), "transcript should be captured");
+        assert!(transcript.unwrap().contains("cold intro"), "transcript content preserved");
+
+        // pending_lessons should surface this pair (no lessons derived yet)
+        let pending = pending_lessons(&conn).unwrap();
+        assert_eq!(pending.len(), 1, "one pending pair");
+        assert_eq!(pending[0].pair_id, pair_id);
+        assert!(pending[0].has_transcript, "should report transcript available");
+
+        // after deriving a lesson, pair drops off pending list
+        add_lesson(&conn, pair_id, "Use 'quick note' not 'reach out'", &[]).unwrap();
+        let pending2 = pending_lessons(&conn).unwrap();
+        assert!(pending2.is_empty(), "pair with lessons should not be pending");
+    }
+
+    #[test]
+    fn pending_lessons_reports_missing_transcript() {
+        let path = tmp_db();
+        let conn = connect_at(&path).unwrap();
+        // draft WITHOUT transcript
+        let id = create_draft(&conn, "draft\n", None, &[], "agent", None).unwrap();
+        save_revision(&conn, id, "final\n", "user").unwrap();
+        finalize_draft(&conn, id).unwrap();
+        let pending = pending_lessons(&conn).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(!pending[0].has_transcript, "should report no transcript");
     }
 }

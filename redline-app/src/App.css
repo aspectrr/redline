@@ -44,7 +44,8 @@ input:focus, textarea:focus { outline: none; border-color: var(--accent); }
   display: flex; align-items: center; gap: 18px;
   padding: 10px 16px; border-bottom: 1px solid var(--border); background: var(--bg-2);
 }
-.brand { font-weight: 700; font-size: 15px; }
+.brand { font-weight: 700; font-size: 15px; display: flex; align-items: center; gap: 8px; }
+.brand img { width: 22px; height: 22px; border-radius: 5px; }
 .tabs { display: flex; gap: 4px; }
 .tabs button { padding: 6px 14px; }
 .search-inline { display: flex; gap: 6px; margin-left: auto; }

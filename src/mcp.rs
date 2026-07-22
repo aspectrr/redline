@@ -123,6 +123,10 @@ struct CreateDraftParams {
     tags: Option<Vec<String>>,
     /// Who produced this draft: "agent" (default) or "user".
     source: Option<String>,
+    /// Full agent transcript/context that produced this draft. Captured at
+    /// draft time so future lesson derivation has the reasoning behind the
+    /// draft, not just the text. Pass your full conversation context.
+    transcript: Option<String>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -214,6 +218,24 @@ struct FeedbackParams {
 
 fn default_info() -> String { "info".into() }
 
+// --- settings + model config params ---
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct SetProviderKeyParams {
+    /// Provider name (e.g. "openai", "anthropic", "ollama").
+    provider: String,
+    /// The API key for this provider.
+    api_key: String,
+    /// Optional: override the base URL (e.g. "https://api.openai.com/v1").
+    base_url: Option<String>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct ListModelsParams {
+    /// Filter by provider name (optional).
+    provider: Option<String>,
+}
+
 // ---------- tools ----------
 
 #[tool_router]
@@ -226,7 +248,7 @@ impl EmailServer {
 
     /// Store a completed (draft → final) email pair and return its id plus the
     /// diff an agent should learn from. The core of the learning loop.
-    #[tool(description = "Store a completed (draft, final) email pair. Returns the new pair id and the unified diff to learn from.")]
+    #[tool(description = "Store a completed (draft, final) document pair. Returns the new pair id and the unified diff to learn from.")]
     fn add_pair(&self, Parameters(p): Parameters<AddPairParams>) -> ToolResult {
         tool_op(|conn| {
             let tags = p.tags.unwrap_or_default();
@@ -328,19 +350,24 @@ impl EmailServer {
     /// all stored voice patterns to respect and lint violations found in the
     /// content. The agent should adjust the draft to resolve violations before
     /// the user sees it.
-    #[tool(description = "Create a new in-flight draft. Returns the draft id, all voice patterns to respect, and lint violations in the content. Fix violations with save_revision before the user sees the draft. This is the main agent entry point — the returned patterns ARE the write loop.")]
+    #[tool(description = "Create a new in-flight draft. Returns the draft id, all voice patterns to respect, lint violations in the content, and any pending unlearned pairs. Fix violations with save_revision before the user sees the draft. Process pending lessons before writing. Pass your full transcript via the transcript param for future derivation. This is the main agent entry point.")]
     fn create_draft(&self, Parameters(p): Parameters<CreateDraftParams>) -> ToolResult {
         tool_op(|conn| {
             let tags = p.tags.unwrap_or_default();
             let source = p.source.as_deref().unwrap_or("agent");
-            let ctx = el::create_draft_with_context(conn, &p.content, p.context.as_deref(), &tags, source)?;
+            let ctx = el::create_draft_with_context(conn, &p.content, p.context.as_deref(), &tags, source, p.transcript.as_deref())?;
             Ok(ok_json(serde_json::json!({
                 "draft_id": ctx.draft_id,
                 "patterns": ctx.patterns,
                 "violations": ctx.violations,
                 "violation_count": ctx.violations.len(),
+                "pending_lessons": ctx.pending_lessons,
                 "next_step": if ctx.violations.is_empty() {
-                    "No violations. The draft is ready for the user to edit."
+                    if ctx.pending_lessons.is_empty() {
+                        "No violations, no pending lessons. The draft is ready for the user to edit."
+                    } else {
+                        "No violations. But there are pending unlearned pairs — review them before proceeding."
+                    }
                 } else {
                     "Fix the violations above with save_revision, then wait for the user to edit."
                 },
@@ -531,6 +558,150 @@ impl EmailServer {
             Ok(ok_json(serde_json::json!({ "feedback": fb })))
         })
     }
+
+    // --- settings + model config ---
+
+    /// Set a provider API key for async derivation.
+    #[tool(description = "Set an API key for a model provider (e.g. openai, anthropic). Used by the async derivation daemon.")]
+    fn set_provider_key(&self, Parameters(p): Parameters<SetProviderKeyParams>) -> ToolResult {
+        tool_op(|conn| {
+            let key = format!("provider:{}:api_key", p.provider);
+            el::set_setting(conn, &key, &p.api_key)?;
+            if let Some(url) = &p.base_url {
+                let url_key = format!("provider:{}:base_url", p.provider);
+                el::set_setting(conn, &url_key, url)?;
+            }
+            Ok(ok_json(serde_json::json!({ "set": true, "provider": p.provider })))
+        })
+    }
+
+    /// Show the current model config that will be used for derivation.
+    #[tool(description = "Show the model config that will be used for async lesson derivation. Auto-detected from pi session, settings, or env vars.")]
+    fn model_config(&self) -> ToolResult {
+        tool_op(|conn| {
+            // Show detection chain
+            let pi_session = el::pi_context::detect_session();
+            let pi_model = el::pi_context::detect_model_config();
+            let detected = el::auto_detect_model_config(conn);
+            let all_settings = el::get_all_settings(conn)?;
+
+            Ok(ok_json(serde_json::json!({
+                "detected_config": detected.map(|c| serde_json::json!({
+                    "provider": c.provider,
+                    "model": c.model,
+                    "base_url": c.base_url,
+                    "has_api_key": c.api_key.is_some(),
+                })),
+                "pi_session": pi_session.map(|s| serde_json::json!({
+                    "session_id": s.session_id,
+                    "provider": s.provider,
+                    "model": s.model,
+                })),
+                "pi_model_config": pi_model.map(|c| serde_json::json!({
+                    "provider": c.provider,
+                    "model": c.model,
+                    "base_url": c.base_url,
+                    "has_api_key": c.api_key.is_some(),
+                })),
+                "settings": all_settings.into_iter()
+                    .filter(|(k, _)| !k.contains("api_key"))
+                    .collect::<Vec<_>>(),
+            })))
+        })
+    }
+
+    /// Sync models from models.dev API into the local cache.
+    #[tool(description = "Fetch and cache model data from models.dev. Returns count of models cached. Run once to populate the model list.")]
+    async fn sync_models(&self) -> ToolResult {
+        // Fetch from models.dev
+        let client = reqwest::Client::new();
+        let resp = client.get("https://models.dev/api.json").send().await;
+
+        let resp = match resp {
+            Ok(r) => r,
+            Err(e) => return Ok(err_text(format!("models.dev fetch failed: {e}"))),
+        };
+
+        if !resp.status().is_success() {
+            return Ok(err_text(format!("models.dev error: {}", resp.status())));
+        }
+
+        let api_data: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => return Ok(err_text(format!("models.dev parse error: {e}"))),
+        };
+
+        // Open DB and cache each model
+        let conn = match el::connect() {
+            Ok(c) => c,
+            Err(e) => return Ok(err_text(format!("DB error: {e}"))),
+        };
+
+        let mut count = 0;
+        if let Some(providers) = api_data.as_object() {
+            for (provider_id, provider_data) in providers {
+                let _provider_name = provider_data.get("name").and_then(|n| n.as_str()).unwrap_or(provider_id);
+                let env_keys = provider_data.get("env").and_then(|e| e.as_array());
+                let api_key_env = env_keys
+                    .and_then(|keys| keys.first())
+                    .and_then(|k| k.as_str())
+                    .map(String::from);
+
+                // Cache provider base URL from the 'api' field.
+                // For big providers without it, use known defaults.
+                let base_url = provider_data.get("api")
+                    .and_then(|a| a.as_str())
+                    .map(String::from)
+                    .unwrap_or_else(|| known_provider_url(provider_id));
+                if !base_url.is_empty() {
+                    let _ = el::set_setting(
+                        &conn,
+                        &format!("provider:{provider_id}:base_url"),
+                        &base_url,
+                    );
+                }
+
+                if let Some(models) = provider_data.get("models").and_then(|m| m.as_object()) {
+                    for (model_id, model_data) in models {
+                        let tool_call = model_data.get("tool_call")
+                            .and_then(|t| t.as_bool())
+                            .unwrap_or(false);
+                        let model_name = model_data.get("name")
+                            .and_then(|n| n.as_str())
+                            .map(String::from);
+
+                        let _ = el::cache_model(
+                            &conn,
+                            model_id,
+                            provider_id,
+                            model_name.as_deref(),
+                            tool_call,
+                            api_key_env.as_deref(),
+                        );
+                        count += 1;
+                    }
+                }
+            }
+        }
+
+        Ok(ok_json(serde_json::json!({
+            "cached": count,
+            "source": "models.dev",
+        })))
+    }
+
+    /// List cached models from models.dev.
+    #[tool(description = "List models cached from models.dev. Optionally filter by provider.")]
+    fn list_models(&self, Parameters(p): Parameters<ListModelsParams>) -> ToolResult {
+        tool_op(|conn| {
+            let models = el::list_cached_models(conn, p.provider.as_deref())?;
+            let out: Vec<_> = models.iter().map(|(id, prov, name, tc, env)| serde_json::json!({
+                "model_id": id, "provider": prov, "name": name,
+                "tool_call": tc, "api_key_env": env,
+            })).collect();
+            Ok(ok_json(serde_json::json!({ "models": out, "count": out.len() })))
+        })
+    }
 }
 
 // ---------- ServerHandler ----------
@@ -546,11 +717,14 @@ impl ServerHandler for EmailServer {
         .with_server_info(Implementation::from_build_env())
         .with_protocol_version(ProtocolVersion::V_2024_11_05)
         .with_instructions(
-            "redline: a local voice-learning system for email agents.\n\
+            "redline: a local writing-learning system for agents.\n\
              \nWORKFLOW (one pass through the loop):\n\
              1. create_draft — writes the draft AND returns all voice patterns + lint\n\
-                violations. Fix violations with save_revision before the user sees it.\n\
-             2. The user edits the draft in the Tauri app (outside this session).\n\
+                violations + any pending unlearned pairs. Fix violations with\n\
+                save_revision before the user sees it. Process pending lessons\n\
+                (derive lessons from their diffs) before drafting. Pass your full\n\
+                transcript so future derivation has context.\n\
+             2. The user edits the draft anywhere (Tauri app, Gmail, Docs, Obsidian).\n\
              3. finalize_draft — stores the (original → edited) pair AND returns diff\n\
                 analysis (deletions, word swaps, pattern hits) + auto-promoted patterns.\n\
                 Derive voice lessons from the analysis and store them with add_lesson\n\
@@ -559,7 +733,10 @@ impl ServerHandler for EmailServer {
              No separate lint call needed. Patterns are the write loop: they catch voice\n\
              issues before the user sees the draft.\n\
              \nGive feedback with give_feedback if anything is painful. One DB is shared\n\
-             by this server, the CLI, and the Tauri app."
+             by this server, the CLI, and the Tauri app.\n\
+             \nModel config for async derivation is auto-detected from your pi session.\n\
+             Check with model_config. Set provider keys with set_provider_key.\n\
+             Sync available models from models.dev with sync_models."
                 .to_string(),
         )
     }
@@ -580,7 +757,7 @@ where
             Err(e) => Ok(err_text(format!("{e:#}"))),
         },
         Err(e) => Ok(err_text(format!(
-            "failed to open email DB at {}: {e:#}",
+            "failed to open writing DB at {}: {e:#}",
             el::db_path().display()
         ))),
     }
@@ -608,6 +785,22 @@ fn preview(s: &str, n: usize) -> String {
     } else {
         let cut: String = collapsed.chars().take(n).collect();
         format!("{cut}…")
+    }
+}
+
+/// Known base URLs for providers that models.dev doesn't expose (they use
+/// npm SDK convention). This covers the providers that have no `api` field
+/// in models.dev/api.json.
+fn known_provider_url(provider: &str) -> String {
+    match provider {
+        "openai" => "https://api.openai.com/v1".into(),
+        "anthropic" => "https://api.anthropic.com/v1".into(),
+        "google" => "https://generativelanguage.googleapis.com/v1beta".into(),
+        "xai" => "https://api.x.ai/v1".into(),
+        "mistral" => "https://api.mistral.ai/v1".into(),
+        "cohere" => "https://api.cohere.ai/v1".into(),
+        "ollama" => "http://localhost:11434/v1".into(),
+        _ => String::new(),
     }
 }
 

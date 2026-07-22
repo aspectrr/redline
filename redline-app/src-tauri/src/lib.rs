@@ -41,6 +41,7 @@ fn create_draft(
         context.as_deref(),
         &tags,
         source.as_deref().unwrap_or("agent"),
+        None,
     ))
 }
 
@@ -189,6 +190,30 @@ fn analyze_pair(pair_id: i64) -> CmdResult<Option<serde_json::Value>> {
 use notify_debouncer_mini::{new_debouncer, DebounceEventResult};
 use std::time::Duration;
 
+/// Spawn the async derivation daemon. Polls for pending derivation jobs every
+/// 30s and processes them via an LLM call if `REDLINE_MODEL_*` config is set.
+/// Runs as long as the app is open — jobs are durable in SQLite so nothing is
+/// lost when the app closes.
+fn spawn_derivation_daemon() {
+    std::thread::spawn(move || {
+        let rt = match tokio::runtime::Runtime::new() {
+            Ok(rt) => rt,
+            Err(_) => return,
+        };
+        rt.block_on(async {
+            loop {
+                let (processed, succeeded, failed) = el::deriver::process_pending().await;
+                if processed > 0 {
+                    tracing::info!(
+                        "derivation daemon: {succeeded}/{processed} succeeded, {failed} failed"
+                    );
+                }
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        });
+    });
+}
+
 /// Spawn a file watcher on the DB directory. Emits `db-changed` Tauri events
 /// when the `.db` or `.db-wal` file is modified by an external process
 /// (CLI or MCP server writing to the same shared DB).
@@ -225,6 +250,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             spawn_db_watcher(app.handle().clone());
+            spawn_derivation_daemon();
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
