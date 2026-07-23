@@ -9,7 +9,7 @@ Make any piece of writing sound like the user. The system learns from **(draft, 
 
 ## Where the data lives
 
-- DB: `~/.redline/emails.db` (shared by CLI, MCP server, and Tauri app). Override with `REDLINE_DB=/path/db`.
+- DB: `~/.redline/redline.db` (shared by CLI, MCP server, and Tauri app). Override with `REDLINE_DB=/path/db`.
 - CLI: `redline` (on PATH)
 - MCP server: `redline mcp` (stdio, auto-configured in pi)
 - Tauri app: `cd redline-app && bun run tauri dev`
@@ -41,6 +41,12 @@ Via CLI:
 ```
 redline draft <file> --context "topic + audience" --tags email,external
 ```
+
+**Match the format to the content type.** A document is not an email. If the user asks for a memo, PRD, or reference document:
+- Use markdown headings (`## Section`), bullet lists, tables
+- Do NOT add "Subject:" lines, "Hi [name]," greetings, or email sign-offs
+- Structure as a reference document with sections, not as a message to a recipient
+- The first tag should be `memo`, `prd`, `internal-doc`, or `content` — not `email`
 
 **Transcript is captured automatically.** When running inside pi, redline detects the active session and pulls the conversation transcript programmatically — you don't need to pass it. This gives the async derivation daemon the full context behind each draft. The transcript is frozen at draft time and used later to understand *why* edits were made.
 

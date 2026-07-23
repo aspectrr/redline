@@ -141,7 +141,7 @@ struct SaveRevisionParams {
     draft_id: i64,
     /// The full new content for the draft.
     content: String,
-    /// Source of this edit: "user" (default), "agent", or "restore".
+    /// Source of this edit: "agent" (default when called by agent), "user", or "restore".
     source: Option<String>,
 }
 
@@ -414,7 +414,7 @@ impl EmailServer {
     #[tool(description = "Save a new revision of a draft (append-only — history is never destroyed). Returns the revision id and updated lint violations so the agent can see what's still wrong.")]
     fn save_revision(&self, Parameters(p): Parameters<SaveRevisionParams>) -> ToolResult {
         tool_op(|conn| {
-            let source = p.source.as_deref().unwrap_or("user");
+            let source = p.source.as_deref().unwrap_or("agent");
             let id = el::save_revision(conn, p.draft_id, &p.content, source)?;
             let violations = el::lint_draft(conn, &p.content)?;
             Ok(ok_json(serde_json::json!({
