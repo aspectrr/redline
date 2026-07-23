@@ -141,7 +141,7 @@ struct SaveRevisionParams {
     draft_id: i64,
     /// The full new content for the draft.
     content: String,
-    /// Source of this edit: "user" (default), "agent", or "restore".
+    /// Source of this edit: "agent" (default when called by agent), "user", or "restore".
     source: Option<String>,
 }
 
@@ -150,6 +150,12 @@ struct RestoreRevisionParams {
     draft_id: i64,
     /// The revision id to restore (appends a new revision — history is never destroyed).
     revision_id: i64,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct LintParams {
+    /// The text to lint against stored voice patterns.
+    content: String,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -414,7 +420,7 @@ impl EmailServer {
     #[tool(description = "Save a new revision of a draft (append-only — history is never destroyed). Returns the revision id and updated lint violations so the agent can see what's still wrong.")]
     fn save_revision(&self, Parameters(p): Parameters<SaveRevisionParams>) -> ToolResult {
         tool_op(|conn| {
-            let source = p.source.as_deref().unwrap_or("user");
+            let source = p.source.as_deref().unwrap_or("agent");
             let id = el::save_revision(conn, p.draft_id, &p.content, source)?;
             let violations = el::lint_draft(conn, &p.content)?;
             Ok(ok_json(serde_json::json!({
@@ -493,8 +499,18 @@ impl EmailServer {
     }
 
     // --- patterns + analysis + feedback ---
-    // Linting is automatic: create_draft and save_revision return violations.
-    // No standalone lint tool — fewer round-trips for the agent.
+    // Linting is automatic in create_draft and save_revision, but also
+    // available standalone for linting external writing (Linear comments,
+    // Google Docs, etc.) without the draft lifecycle.
+
+    /// Lint any text against stored voice patterns. No draft needed.
+    #[tool(description = "Lint any text against all stored voice patterns without creating a draft. Use this before writing to external systems (Linear, Google Docs, Slack, etc.) to catch voice violations. Returns violations only — no draft, no lifecycle.")]
+    fn lint(&self, Parameters(p): Parameters<LintParams>) -> ToolResult {
+        tool_op(|conn| {
+            let violations = el::lint_draft(conn, &p.content)?;
+            Ok(ok_json(serde_json::json!({ "violations": violations })))
+        })
+    }
 
     /// Add a matchable voice pattern the lint engine will check drafts against.
     #[tool(description = "Add a matchable voice pattern for the lint engine. pattern_type is 'literal' or 'regex'. direction is 'avoid' (flag if found) or 'prefer' (flag if absent). Returns the new pattern id.")]

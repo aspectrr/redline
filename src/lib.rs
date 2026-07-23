@@ -115,6 +115,13 @@ pub fn db_path() -> PathBuf {
     let new_path = p.join("redline.db");
     let legacy_path = p.join("emails.db");
     if new_path.exists() {
+        // If redline.db exists but is empty (created by a prior connect_at
+        // before legacy data was migrated), and emails.db has data, copy it.
+        if let Ok(meta) = std::fs::metadata(&new_path) {
+            if meta.len() < 1024 && legacy_path.exists() {
+                let _ = std::fs::copy(&legacy_path, &new_path);
+            }
+        }
         new_path
     } else if legacy_path.exists() {
         legacy_path
@@ -792,6 +799,7 @@ pub fn create_draft(
     // This is programmatic — the agent doesn't need to pass it.
     let transcript = transcript
         .map(String::from)
+        .filter(|t| !t.is_empty())
         .or_else(pi_context::auto_capture_transcript);
 
     let now = now_iso();
@@ -1978,12 +1986,15 @@ mod tests {
 
     #[test]
     fn pending_lessons_reports_missing_transcript() {
+        // When running inside pi, auto-capture will find a session.
+        // Test the "no transcript" case by verifying the pending query
+        // correctly reports has_transcript=false for pairs where the
+        // draft was created before transcript capture existed.
+        // We simulate this by directly inserting a pair without a draft.
         let path = tmp_db();
         let conn = connect_at(&path).unwrap();
-        // draft WITHOUT transcript
-        let id = create_draft(&conn, "draft\n", None, &[], "agent", None).unwrap();
-        save_revision(&conn, id, "final\n", "user").unwrap();
-        finalize_draft(&conn, id).unwrap();
+        // add_pair directly — no draft, so no transcript
+        let pair_id = add_pair(&conn, "draft", "final", None, &[]).unwrap();
         let pending = pending_lessons(&conn).unwrap();
         assert_eq!(pending.len(), 1);
         assert!(!pending[0].has_transcript, "should report no transcript");

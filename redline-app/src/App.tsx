@@ -1,6 +1,7 @@
 import { createSignal, createMemo, createEffect, onMount, onCleanup, on, For, Show, type JSX } from "solid-js";
 import { api, parseDiff } from "./lib/api";
 import type { Draft, DraftWithRevisions, Lesson, Pair, SearchResult, Pattern, Violation, Feedback, DiffAnalysis } from "./lib/api";
+import { marked } from "marked";
 import "./App.css";
 
 type View = "drafts" | "library" | "search" | "lessons" | "patterns" | "feedback";
@@ -22,6 +23,7 @@ export default function App() {
   const [tagsStr, setTagsStr] = createSignal("");
   const [rightTab, setRightTab] = createSignal<RightTab>("diff");
   const [error, setError] = createSignal<string | null>(null);
+  const [mdPreview, setMdPreview] = createSignal(false);
 
   // library
   const [pairs, setPairs] = createSignal<Pair[]>([]);
@@ -304,11 +306,18 @@ export default function App() {
                   <span>draft #{current()!.draft.id}</span>
                   <span>{current()!.revisions.length} revision(s)</span>
                   <span>{saving() ? "saving…" : dirty() ? "unsaved" : "saved"}</span>
+                  <button class="md-toggle" classList={{ active: mdPreview() }}
+                    title="Toggle markdown preview"
+                    onClick={() => setMdPreview(v => !v)}>👁</button>
                 </div>
-                <textarea class="editor" value={editorText()}
-                  onInput={e => onEditorInput(e.currentTarget.value)}
-                  disabled={current()!.draft.status === "finalized"}
-                  placeholder="Write the email…" spellcheck={false} />
+                <Show when={!mdPreview()} fallback={
+                  <div class="md-preview" innerHTML={marked.parse(editorText()) as string} />
+                }>
+                  <textarea class="editor" value={editorText()}
+                    onInput={e => onEditorInput(e.currentTarget.value)}
+                    disabled={current()!.draft.status === "finalized"}
+                    placeholder="Write here…" spellcheck={false} />
+                </Show>
               </>
             ) : (
               <div class="empty-editor">Select a draft, or start a new one.</div>

@@ -9,18 +9,26 @@ Make any piece of writing sound like the user. The system learns from **(draft, 
 
 ## Where the data lives
 
-- DB: `~/.redline/emails.db` (shared by CLI, MCP server, and Tauri app). Override with `REDLINE_DB=/path/db`.
+- DB: `~/.redline/redline.db` (shared by CLI, MCP server, and Tauri app). Override with `REDLINE_DB=/path/db`.
 - CLI: `redline` (on PATH)
 - MCP server: `redline mcp` (stdio, auto-configured in pi)
 - Tauri app: `cd redline-app && bun run tauri dev`
 
 No LLM calls from the CLI/server. You do all reasoning in-session.
 
-## The single workflow
+## Linting external writing
 
-When asked to write or revise any document, follow this loop. One pass through it = full cycle.
+Not everything needs the draft→finalize loop. For quick writing that goes directly to external systems — Linear comments, Google Docs, Slack messages, social posts — just lint first:
 
-### 0. Process pending lessons (before drafting)
+```
+lint(content)
+```
+
+Returns violations only. No draft created, no lifecycle, no learning. Fix violations, then post to wherever it's going.
+
+## The draft workflow
+
+When a piece of writing needs the full learning loop, follow these steps:
 
 `create_draft` returns `pending_lessons` — finalized pairs that have no derived lessons yet. Before writing a new draft, process them:
 
@@ -41,6 +49,12 @@ Via CLI:
 ```
 redline draft <file> --context "topic + audience" --tags email,external
 ```
+
+**Match the format to the content type.** A document is not an email. If the user asks for a memo, PRD, or reference document:
+- Use markdown headings (`## Section`), bullet lists, tables
+- Do NOT add "Subject:" lines, "Hi [name]," greetings, or email sign-offs
+- Structure as a reference document with sections, not as a message to a recipient
+- The first tag should be `memo`, `prd`, `internal-doc`, or `content` — not `email`
 
 **Transcript is captured automatically.** When running inside pi, redline detects the active session and pulls the conversation transcript programmatically — you don't need to pass it. This gives the async derivation daemon the full context behind each draft. The transcript is frozen at draft time and used later to understand *why* edits were made.
 
@@ -88,6 +102,7 @@ Store a matchable pattern: `redline add-pattern --rule "<rule>" --pattern "<matc
 
 | CLI | MCP | Purpose |
 |---|---|---|
+| — | `lint` | Lint any text against voice patterns — no draft needed |
 | `draft` | `create_draft` | Write draft, pass transcript, get patterns + violations + pending lessons |
 | `finalize` | `finalize_draft` | Finalize pair, get diff analysis + promotions back |
 | `analyze <pair_id>` | `analyze_diff` | Deep-dive: deletions, categorized changes, swaps, hits |

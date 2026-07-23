@@ -30,47 +30,56 @@ pub struct PiSession {
 
 /// Detect the active pi session from the current environment.
 /// Returns None if not running inside pi or no session found.
+///
+/// Works in two contexts:
+/// - MCP server process (has PI_CODING_AGENT + inherits pi's CWD)
+/// - Tauri app process (has ORCA_PI_SOURCE_AGENT_DIR but its own CWD)
+///
+/// Strategy: scan ALL session dirs for the most recently modified .jsonl.
+/// The active session is whichever was touched last — we can't rely on
+/// CWD because the Tauri app's CWD is src-tauri, not the workspace.
 pub fn detect_session() -> Option<PiSession> {
-    if std::env::var("PI_CODING_AGENT").is_err() {
+    // Both pi MCP servers and pi-spawned processes have one of these.
+    // A bare terminal process won't.
+    if std::env::var("ORCA_PI_SOURCE_AGENT_DIR").is_err()
+        && std::env::var("PI_CODING_AGENT").is_err()
+    {
         return None;
     }
 
     let agent_dir = pi_agent_dir();
     let sessions_dir = agent_dir.join("sessions");
-    let cwd = std::env::current_dir().ok()?;
-
-    // Session dir naming: replace / with -, wrap in -- and --
-    let encoded = cwd.to_string_lossy().replace('/', "-");
-    let session_dir_name = format!("-{encoded}-");
-    let session_dir = sessions_dir.join(&session_dir_name);
-
-    if !session_dir.exists() {
+    if !sessions_dir.exists() {
         return None;
     }
 
-    // Find the most recently modified .jsonl file
-    let mut entries: Vec<_> = std::fs::read_dir(&session_dir).ok()?
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path().extension().map(|ext| ext == "jsonl").unwrap_or(false)
-        })
-        .collect();
+    // Find the most recently modified .jsonl across ALL session dirs.
+    // The active pi session is whichever .jsonl was touched last.
+    //
+    // ponytail: scanning all session dirs is O(n_dirs * n_files) but
+    // typically <200 dirs with <5 files each. Fine for a per-draft call.
+    let mut newest_file: Option<(std::path::PathBuf, std::time::SystemTime)> = None;
 
-    // Sort by modification time, newest first
-    entries.sort_by(|a, b| {
-        b.metadata().and_then(|m| m.modified()).ok()
-            .cmp(&a.metadata().and_then(|m| m.modified()).ok())
-    });
+    for dir_entry in std::fs::read_dir(&sessions_dir).ok()?.filter_map(|e| e.ok()) {
+        let dir_path = dir_entry.path();
+        if !dir_path.is_dir() { continue; }
+        for file_entry in std::fs::read_dir(&dir_path).ok().into_iter().flatten().filter_map(|e| e.ok()) {
+            let path = file_entry.path();
+            if path.extension().map(|ext| ext != "jsonl").unwrap_or(true) { continue; }
+            if let Ok(modified) = file_entry.metadata().and_then(|m| m.modified()) {
+                match &newest_file {
+                    Some((_, best)) if &modified <= best => {}
+                    _ => newest_file = Some((path, modified)),
+                }
+            }
+        }
+    }
 
-    let session_entry = entries.first()?;
-    let session_file = session_entry.path();
+    let session_file = newest_file?.0;
 
     // Read the first line to get session metadata
     let first_line = std::fs::read_to_string(&session_file)
-        .ok()?
-        .lines()
-        .next()?
-        .to_string();
+        .ok()?.lines().next()?.to_string();
 
     let session_meta: serde_json::Value = serde_json::from_str(&first_line).ok()?;
     if session_meta.get("type").and_then(|t| t.as_str()) != Some("session") {
