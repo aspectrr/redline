@@ -16,11 +16,19 @@ Make any piece of writing sound like the user. The system learns from **(draft, 
 
 No LLM calls from the CLI/server. You do all reasoning in-session.
 
-## The single workflow
+## Linting external writing
 
-When asked to write or revise any document, follow this loop. One pass through it = full cycle.
+Not everything needs the draft→finalize loop. For quick writing that goes directly to external systems — Linear comments, Google Docs, Slack messages, social posts — just lint first:
 
-### 0. Process pending lessons (before drafting)
+```
+lint(content)
+```
+
+Returns violations only. No draft created, no lifecycle, no learning. Fix violations, then post to wherever it's going.
+
+## The draft workflow
+
+When a piece of writing needs the full learning loop, follow these steps:
 
 `create_draft` returns `pending_lessons` — finalized pairs that have no derived lessons yet. Before writing a new draft, process them:
 
@@ -94,6 +102,7 @@ Store a matchable pattern: `redline add-pattern --rule "<rule>" --pattern "<matc
 
 | CLI | MCP | Purpose |
 |---|---|---|
+| — | `lint` | Lint any text against voice patterns — no draft needed |
 | `draft` | `create_draft` | Write draft, pass transcript, get patterns + violations + pending lessons |
 | `finalize` | `finalize_draft` | Finalize pair, get diff analysis + promotions back |
 | `analyze <pair_id>` | `analyze_diff` | Deep-dive: deletions, categorized changes, swaps, hits |
